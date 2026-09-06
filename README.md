@@ -209,8 +209,7 @@ Connection模块是对Buffer模块，Socket模块，Channel模块的一个整体
    - 每个 `accept` 到的新连接，都会交给一个 `Connection` 管，它代表“客户端和服务端之间这一次会话”
 
 2. **把底层模块串起来**
-   - 里面有 `Socket`、 `Channel`、两个 `Buffer`
-   - 所以它是 `Buffer + Socket + Channel` 的整体封装
+   - 里面有 `Socket`、 `Channel`、两个 `Buffer`，所以它是 `Buffer + Socket + Channel` 的整体封装
 
 3. **负责读写流程**
    - 读数据：socket 收到字节流，先放进接收缓冲区
@@ -224,16 +223,63 @@ Connection模块是对Buffer模块，Socket模块，Channel模块的一个整体
    - 协议切换（回调函数切换）
    - 启动/取消非活跃连接超时释放
 
-<!-- 具体处理流程如下：
+具体处理流程如下：
 
 1. 实现向Channel提供可读，可写，错误等不同事件的IO事件回调函数，然后将Channel和对应的描述符添加到Poller事件监控中。
-
 2. 当描述符在Poller模块中就绪了IO可读事件，则调用描述符对应Channel中保存的读事件处理函数，进行数据读取，将socket接收缓冲区全部读取到Connection管理的用户态接收缓冲区中。然后调用由组件使用者传入的新数据到来回调函数进行处理。
-
 3. 组件使用者进行数据的业务处理完毕后，通过Connection向使用者提供的数据发送接口，将数据写入Connection的发送缓冲区中。
+4. 启动描述符在Poller模块中的IO写事件监控，就绪后，调用Channel中保存的写事件处理函数，将发送缓冲区中的数据通过Socket进行面向系统的实际数据发送。
 
-4. 启动描述符在Poll模块中的IO写事件监控，就绪后，调用Channel中保存的写事件处理函数，将发送缓冲区中的数据通过Socket进行面向系统的实际数据发送。 -->
 
+
+
+```mermaid
+flowchart TB
+
+    C["Connection<br/>通信连接管理"]
+
+    API["对外功能接口<br/>
+    关闭连接｜发送数据｜切换协议<br/>
+    启动非活跃销毁｜取消非活跃销毁"]
+
+    INNER["内部操作接口<br/>
+    Socket 接收数据｜Socket 发送数据<br/>
+    关闭 Socket 并解除监控｜刷新活跃度"]
+
+    TCP["TcpServer 事件回调<br/>
+    连接建立｜新数据接收<br/>
+    任意事件｜连接关闭"]
+
+    subgraph MODULES["Connection 内部使用的模块"]
+        direction LR
+
+        B["Buffer<br/>
+        保存接收数据和待发送数据<br/>
+        放入数据｜取出数据"]
+
+        S["Socket<br/>
+        封装套接字操作<br/>
+        创建监听｜获取连接<br/>
+        接收数据｜发送数据"]
+
+        CH["Channel<br/>
+        管理 fd 事件和回调<br/>
+        可读｜可写｜挂断<br/>
+        错误｜任意事件"]
+    end
+
+    C --> API
+    C --> INNER
+    C --> TCP
+    C --> MODULES
+
+    S -. "Socket 事件由 Channel 触发回调" .-> CH
+    S -. "接收数据进入 Buffer" .-> B
+    API -. "发送数据进入 Buffer" .-> B
+```
+
+
+---
 
 #### Acceptor模块
 
@@ -267,6 +313,106 @@ Acceptor模块是对Socket模块，Channel模块的一个整体封装，实现�
 - 都靠这个 `Channel` 去触发对应回调
 
 **`Connection` 中的 `Channel` 负责后续读写和关闭等回调。**
+
+#### TimerQueue模块
+TimerQueue模块是实现固定时间定时任务的模块，向定时任务管理器中添加一个任务，任务将在固定时间后被执行，同时也可以重新设置定时任务来延迟任务的执行。
+
+这个模块对Connection对象的生命周期管理，对非活跃连接进行超时后的释放，其中包含有：
+
+- 一个timerfd：linux系统提供的定时器。
+- 一个Channel对象：实现对timerfd的IO时间就绪回调处理
+
+#### Poller模块：
+Poller模块是对epoll进行封装的一个模块，实现epoll的IO事件添加，修改，移除，获取活跃连接功能，主要有以下功能：
+
+1. **注册 fd 到事件监控里**
+   - 把 `Channel` 关心的事件交给底层系统，比如读事件、写事件
+
+2. **修改监听事件**
+   - 某个连接现在不想监听写了，就把写事件去掉，某个 fd 状态变了，就更新监控内容
+
+3. **删除 fd 监听**
+   - 连接关闭后，从事件集合里移除
+
+4. **等待就绪事件**
+   - 调用 `epoll_wait` 之类的接口阻塞等待，一旦有事件发生，把“活跃的 Channel”返回给上层，接下来就是调用对应的回调函数。
+
+#### EventLoop模块
+
+一个从Reactor对应一个EventLoop，作用：**管理一个线程，持续等待和分发该线程负责的网络事件**。
+
+分配过程通常是：
+
+1. 主 Reactor 通过监听 fd 发现有新连接。
+2. `Acceptor` 调用 `accept` 得到新的连接 fd。
+3. 主 Reactor 选择一个从 Reactor。
+4. 主 Reactor 把“注册这个连接 fd”的任务放入该从 Reactor 的任务队列。
+5. 通过 `wakeup` 唤醒从 Reactor。
+6. 从 Reactor 在线程内部执行任务，把 fd 注册到自己的 `epoll`。
+7. 之后这个连接的读写和业务处理都由该从 Reactor 负责。
+
+由于**一个连接分配给一个从 Reactor 后，通常一直由它负责，不会频繁转移。**，可以避免线程安全问题：
+
+- 多个线程同时操作同一个 `Connection`。
+- 多个线程同时读写同一个 `Buffer`。
+- 一个线程修改 `Channel`，另一个线程同时处理它的事件。
+- 多个线程同时向同一个连接注册或注销 fd。
+
+EventLoop 包含：
+
+1. `Poller`：通过 `epoll` 监控多个 fd。
+2. `eventfd`：用于唤醒阻塞中的 `epoll_wait`。
+3. `Channel`：管理 `eventfd` 等 fd 的事件和回调。
+4. `TimerQueue`：管理定时任务。
+5. `PendingTask` 队列：对Connection进行的所有操作，都加入到任务队列中，在EventLoop对应的线程中进行执行。
+6. 每一个Connection对象都会绑定到一个EventLoop上。
+
+```plain
+一个从 Reactor
+    └── 一个 EventLoop
+            ├── Connection 1（fd1）
+            ├── Connection 2（fd2）
+            └── Connection 3（fd3）
+```
+具体操作流程：
+
+1. 通过Poller模块对当前模块管理内的所有描述符进行IO事件监控，有描述符事件就绪后，通过描述符对应的Channel进行事件处理。
+2. 所有**就绪的描述符IO事件处理完毕后**，对任务队列中的所有操作顺序进行执行。
+3. 由于epoll的事件监控，有可能会因为没有事件到来而持续阻塞，导致任务队列中的任务不能及时得到执行，因此创建了eventfd，添加到Poller的事件监控中，用于实现每次**向任务队列添加任务的时候，通过向eventfd写入数据来唤醒epoll的阻塞。**
+
+#### TcpServer模块：
+主要工作在主Reactor中，内部封装了Acceptor模块，EventLoopThreadPool模块。包含以下：
+
+- 一个EventLoop对象：以备在超轻量使用场景中不需要EventLoop线程池，只需要在主线程中完成所有操作的情况。
+- 一个EventLoopThreadPool对象：EventLoop线程池（子Reactor线程池）
+- 一个Acceptor对象：一个TcpServer服务器，必然对应有一个监听套接字，能够完成获取客户端新连接，并处理的任务。
+
+- TcpServer模块内部包含有一个`std::shared_ptr<Connection>`的hash表：保存了所有的新建连接对应的Connection，注意，所有的Connection使用shared_ptr进行管理，这样能够保证在hash表中删除了Connection信息后，在shared_ptr计数器为0的情况下完成对Connection资源的释放操作。
+
+主要功能有：
+
+1. **监听连接的管理**
+负责客户端新连接的接入处理，获取新连接之后的处理逻辑由TcpServer模块统一设置，完成新连接的接收、初始化与分配。
+
+2. **通信连接的管理**
+管控所有已建立通信的连接，连接产生的各类IO事件（读事件、写事件等）的处理规则，由TcpServer模块统一配置。
+
+3. **超时连接的管理**
+负责连接的健康状态管理，连接非活跃超时后是否关闭、资源是否回收的策略，由TcpServer模块设置，避免非活跃连接占用服务器资源。
+
+4. **事件监控的管理**
+负责底层事件循环的资源调度，服务器启动多少个线程、创建多少个EventLoop事件循环，都由TcpServer进行配置。
+
+5. **事件回调函数的设置**
+事件处理回调由使用者配置给TcpServer，再由TcpServer下发给每一个Connection连接。
+
+具体操作流程如下：
+
+1. 在实例化TcpServer对象过程中，完成BaseLoop的设置，Acceptor对象的实例化，以及EventLoop线程池的实例化，以及`std::shared_ptr<Connection>`的hash表的实例化。
+2. 为Acceptor对象设置回调函数：获取到新连接后，为新连接构建Connection对象，设置Connection的各项回调，并使用shared_ptr进行管理，并添加到hash表中进行管理，并为Connection选择一个EventLoop线程，为Connection添加一个定时销毁任务，为Connection添加事件监控，
+3. 启动BaseLoop。
+
+
 
 
 
