@@ -444,3 +444,119 @@ flowchart LR
   E --> E1[TimerQueue<br/>处理超时和定时任务]
   E --> E2[日志/回调<br/>记录运行信息和业务处理]
 ```
+
+### 1.4 Linux定时器timerfd
+
+#### 1.4.1 timerfd_create
+
+```cpp
+int timerfd_create(int clockid, int flags);
+```
+
+- `clockid`
+
+  - 指定定时器使用的时钟类型。
+  - `CLOCK_MONOTONIC`：单调时钟，不受系统时间修改影响，常用于超时定时（推荐使用）。
+  - `CLOCK_REALTIME`：系统实时时钟，会受系统时间修改影响。
+
+- `flags`
+
+  - 指定文件描述符属性。
+  - `TFD_CLOEXEC`：执行 `exec()` 时自动关闭文件描述符。
+  - `TFD_NONBLOCK`：设置为非阻塞模式。
+  - 多个标志可以使用 `|` 组合。
+
+- 返回值
+
+  - 成功：返回定时器文件描述符。
+  - 失败：返回 `-1`，并设置 `errno`。
+
+
+
+#### `timerfd_settime`
+
+```cpp
+int timerfd_settime(
+    int fd,
+    int flags,
+    const struct itimerspec *new_value,
+    struct itimerspec *old_value
+);
+
+struct timespec {
+    time_t tv_sec;  // 秒
+    long   tv_nsec; // 纳秒
+};// 总时间等于之和
+
+
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+
+```
+
+- `fd`
+
+  - `timerfd_create()` 返回的定时器文件描述符。
+
+- `flags`
+
+  - `0`：`new_value->it_value` 表示相对时间，例如“5 秒后触发”。
+  - `TFD_TIMER_ABSTIME`：表示绝对时间，例如“在某个指定时间点触发”。
+  - `TFD_TIMER_CANCEL_ON_SET`：系统时间发生变化时取消定时器，通常与 `TFD_TIMER_ABSTIME` 一起使用。
+
+- `new_value`
+
+  - 指向新的定时器设置。
+  - `it_value`：首次触发时间。
+  - `it_interval`：重复触发的时间间隔，为 `0` 表示一次性定时器。
+
+- `old_value`
+
+  - 用于保存设置前的定时器配置。
+  - 不需要获取旧配置时，可以传入 `NULL`。
+
+- 返回值
+
+  - 成功：返回 `0`。
+  - 失败：返回 `-1`，并设置 `errno`。
+
+### 1.5 多级时间轮设计
+
+时间轮本质上是用 **“时间槽 + 指针”代替遍历所有连接**：把定时任务按照超时时间放入对应的槽中，例如当前 `tick=0`，一个 3 秒后执行的任务就放入 `slot=3`，之后指针每秒移动一格，只处理当前槽中的任务，因此**不需要每次遍历全部连接**；
+
+如果存在大量不同时间范围的任务，可以使用**多级时间轮**，将长时间任务先放到**分钟轮、小时轮，随着时间临近再逐级下沉到秒轮**。
+
+管理非活跃的销毁任务时，将定时任务封装到类中，示例化时添加定时任务，并用`share_ptr`进行管理，当时间到达时，触发销毁逻辑（share_ptr--），如果引用计数归零，则真正执行析构，**非活跃任务->活跃任务时用老的类创建一个新的类，产生新的定时任务，shared_ptr++，这样老的定时任务执行时不会析构已经激活的连接。**
+
+
+> `shared_ptr` 应该用 `std::make_shared<T>()` 或由已有的 `shared_ptr` 拷贝/移动来创建，**不要用同一个裸指针反复构造多个独立的 `shared_ptr`**，否则会导致重复释放。项目使用`weak_ptr`来获得`shared_ptr`，进行新的定时任务的创建，避免重复释放。
+
+```plain
+              ┌── 定时任务1 ── shared_ptr ┐
+连接对象 ──────┤                          ├→ 同一个连接对象
+              └── 定时任务2 ── shared_ptr ┘
+```
+时间轮结构图：
+```mermaid
+flowchart LR
+    T[定时任务] --> H
+
+    subgraph H[小时级时间轮]
+        H1[Slot 0] --> H2[Slot 1] --> H3[...] --> H4[Slot 23]
+    end
+
+    subgraph M[分钟级时间轮]
+        M1[Slot 0] --> M2[Slot 1] --> M3[...] --> M4[Slot 59]
+    end
+
+    subgraph S[秒级时间轮]
+        S1[Slot 0] --> S2[Slot 1] --> S3[...] --> S4[Slot 59]
+    end
+
+    H -->|时间临近| M
+    M -->|时间临近| S
+    S -->|Tick到达| E[执行任务]
+```
+
