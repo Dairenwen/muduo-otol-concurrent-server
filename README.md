@@ -647,3 +647,76 @@ match[4] // HTTP/1.1
 match[5] // Host: localhost\r\nConnection: keep-alive\r\n
 ```
 
+### 1.7 Any类型
+
+在服务器中，`Connection` 类负责管理一条通用的 TCP 连接，但不同连接上层可能运行不同的应用层协议，例如 HTTP、WebSocket 或 RPC，而不同协议又需要保存各自不同的解析状态信息。例如 HTTP 需要保存当前解析到请求行、请求头还是请求体，以及已经解析出的 `HttpRequest`，这些信息可以封装在 `HttpContext` 中；WebSocket 则可能需要保存握手状态和数据帧解析状态，因此它的上下文类型又完全不同。如果直接在 `Connection` 中定义 `HttpContext` 成员，那么 `Connection` 就会和 HTTP 协议强耦合，无法方便地复用于其他协议。为了解决这个问题，可以在 `Connection` 中使用 `std::any` 或自定义的 `Any` 类型保存协议上下文。`any` 本身并不负责协议解析，它只是一个可以存放任意类型对象的通用容器：当连接用于 HTTP 时，其中保存 `HttpContext`；用于 WebSocket 时，则保存 `WebSocketContext`。这样 `Connection` 只负责连接管理和上下文存储，而具体协议模块负责定义和解释自己的上下文数据，从而实现网络连接层与应用层协议之间的解耦。
+
+
+`Any` 类型的设计目标是让同一个变量能够保存任意类型的数据，其核心思想是 **类型擦除（Type Erasure）**。所谓类型擦除，并不是把真实的数据类型删除，而是把不同的具体类型统一隐藏在一个公共的基类接口之后。在这个设计中，首先定义抽象基类 `holder`，用于提供所有数据包装对象都必须具备的统一接口；然后定义模板子类 `placeholder<T>` 继承 `holder`，由它真正保存具体的 `T` 类型数据，例如 `int`、`string`、`HttpContext` 等。`Any` 自身并不直接保存这些具体类型，而只维护一个 `holder* _content` 指针。这样，当存入 `int` 时，内部实际创建的是 `placeholder<int>`；存入 `string` 时，创建的是 `placeholder<string>`，但对于 `Any` 来说，它们都可以统一通过 `holder*` 进行管理。真实类型仍然保存在 `placeholder<T>` 内部，而 `Any` 本身无需知道具体类型是什么，这就实现了“内部保留具体类型、外部隐藏具体类型”的类型擦除。
+
+```cpp
+class holder {
+public:
+    virtual ~holder() {}
+};
+
+template<class T>
+class placeholder : public holder {
+public:
+    T _val;
+};
+
+class Any {
+private:
+    holder* _content;
+};
+```
+
+例如：
+
+```cpp
+Any a = 10;                   // 内部实际保存 placeholder<int>
+Any b = std::string("hello"); // 内部实际保存 placeholder<string>
+```
+
+不想实现也可以直接使用`#include <any>`中库函数，注意cmakelist中要设置为C++17标准，否则会编译失败，使用示例：
+```cpp
+#include <any>
+#include <iostream>
+#include <string>
+
+std::any a;                         // 创建空 any
+a = 10;                             // 保存 int
+a = std::string("hello");           // 可以随时替换为其他类型
+
+std::string s = std::any_cast<std::string>(a);   // 按值取出，类型错误会抛 std::bad_any_cast
+std::string& ref = std::any_cast<std::string&>(a); // 按引用取出，可直接修改 any 内部对象
+
+if (auto* p = std::any_cast<std::string>(&a))    // 按指针取出，类型错误返回 nullptr，不抛异常
+{
+    *p = "world";
+}
+
+if (a.type() == typeid(std::string))             // 获取当前保存的数据类型
+{
+    std::cout << std::any_cast<std::string>(a);
+}
+
+std::cout << a.has_value();       // 判断是否保存了数据
+a.reset();                        // 清空 any
+
+struct Context
+{
+    int state;
+};
+
+a = Context{1};                   // 可以保存自定义类型
+Context* ctx = std::any_cast<Context>(&a);
+
+a.emplace<Context>(2);            // 直接在 any 内部构造对象
+std::any b = std::make_any<Context>(3); // 创建并初始化一个 any
+```
+
+`std::any` 的核心作用是通过类型擦除保存任意可复制类型；读取时使用 `std::any_cast<T>` 恢复真实类型。工程中推荐优先使用指针形式 `std::any_cast<T>(&a)`，因为类型不匹配时只返回 `nullptr`，不会抛异常。
+
+
