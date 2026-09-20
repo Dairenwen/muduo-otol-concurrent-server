@@ -2,12 +2,12 @@
 #include <vector>
 #include <assert.h>
 #include <stdint.h>
+#include <cstring>
 #include <string>
+const int BUFFER_SIZE = 100;
 
 class Buffer
 {
-    const int BUFFER_SIZE = 100;
-
 private:
     std::vector<char> _buffer; // 缓冲区数组
     uint64_t _reader_ptr;      // 读取指针
@@ -28,9 +28,11 @@ public:
     void WriteBuffer(Buffer &data);
     void WriteAndPush(const char *data, uint64_t len);
     std::string ReadAsString(uint64_t len);
+    std::string GetLine();
     void WriteStringAndPush(const std::string &data);
     void WriteBufferAndPush(Buffer &data);
-    std::string ReadAsStringAndPop(void *buf, uint64_t len);
+    std::string ReadAsStringAndPop(uint64_t len);
+    char *FindCRLF();
     void Read(char *data, uint64_t len); // 读取数据
     void clear();                        // 清空缓存
 };

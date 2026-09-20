@@ -95,11 +95,24 @@ std::string Buffer::ReadAsString(uint64_t len)
     Read(&ret[0], len);
     return ret;
 }
-std::string Buffer::ReadAsStringAndPop(void *buf, uint64_t len)
+std::string Buffer::ReadAsStringAndPop(uint64_t len)
 {
     std::string ret = ReadAsString(len);
     MoveReaderPtr(len);
     return ret;
+}
+char *Buffer::FindCRLF()
+{
+    return (char *)memchr(GetReaderPtr(), '\n', ReadAbleSize()); // 找到换行符的位置
+}
+std::string Buffer::GetLine()
+{
+    char *pos = FindCRLF();
+
+    if (pos == nullptr)
+        return "";
+
+    return ReadAsStringAndPop(pos - GetReaderPtr() + 1);
 }
 void Buffer::clear()
 {
