@@ -6,9 +6,11 @@
 #include "timewheel.hpp"
 #include <regex>
 #include "server.hpp"
+#include "buffer.hpp"
 #include <assert.h>
 #include "any.hpp"
 #include "log.hpp"
+#include "socket.hpp"
 using namespace std;
 
 // 测试时间轮的timerfd功能
@@ -246,11 +248,9 @@ void testAny()
 }
 void testserver()
 {
-    std::cout << "========== Buffer Test Begin ==========\n";
+    std::cout << "=============== Buffer Test Begin ===============\n";
 
-    // ------------------------------------------------
     // 1. 测试初始化
-    // ------------------------------------------------
     {
         Buffer buf;
 
@@ -261,114 +261,67 @@ void testserver()
         std::cout << "[PASS] 初始化测试\n";
     }
 
-    // ------------------------------------------------
     // 2. 测试 WriteStringAndPush
-    // ------------------------------------------------
     {
         Buffer buf;
-
         std::string str = "hello world";
-
         buf.WriteStringAndPush(str);
-
         assert(buf.ReadAbleSize() == str.size());
-
         std::string result = buf.ReadAsString(str.size());
-
         assert(result == str);
-
         // ReadAsString 不应该移动 reader
         assert(buf.ReadAbleSize() == str.size());
-
         std::cout << "[PASS] 写入测试\n";
     }
 
-    // ------------------------------------------------
     // 3. 测试 ReadAsStringAndPop
-    // ------------------------------------------------
     {
         Buffer buf;
-
         buf.WriteStringAndPush("abcdef");
-
-        std::string result =
-            buf.ReadAsStringAndPop(3);
-
+        std::string result = buf.ReadAsStringAndPop(3);
         assert(result == "abc");
-
         assert(buf.ReadAbleSize() == 3);
-
         assert(buf.ReadAsString(3) == "def");
-
         std::cout << "[PASS] 读取并移动 reader 测试\n";
     }
 
-    // ------------------------------------------------
     // 4. 测试连续写入
-    // ------------------------------------------------
     {
         Buffer buf;
 
         buf.WriteStringAndPush("hello");
         buf.WriteStringAndPush(" ");
         buf.WriteStringAndPush("world");
-
         assert(buf.ReadAbleSize() == 11);
-
-        assert(
-            buf.ReadAsString(11) ==
-            "hello world");
-
+        assert(buf.ReadAsString(11) == "hello world");
         std::cout << "[PASS] 连续写入测试\n";
     }
 
-    // ------------------------------------------------
     // 5. 测试部分读取
-    // ------------------------------------------------
     {
         Buffer buf;
-
         buf.WriteStringAndPush("123456789");
-
-        assert(
-            buf.ReadAsStringAndPop(3) ==
-            "123");
-
-        assert(
-            buf.ReadAsStringAndPop(3) ==
-            "456");
-
-        assert(
-            buf.ReadAsStringAndPop(3) ==
-            "789");
-
+        assert(buf.ReadAsStringAndPop(3) == "123");
+        assert(buf.ReadAsStringAndPop(3) == "456");
+        assert(buf.ReadAsStringAndPop(3) == "789");
         assert(buf.ReadAbleSize() == 0);
-
         std::cout << "[PASS] 连续读取测试\n";
     }
 
-    // ------------------------------------------------
     // 6. 测试头部空间搬移
-    // ------------------------------------------------
     {
         Buffer buf;
-
         // 几乎填满整个 Buffer
-        std::string first(
-            BUFFER_SIZE - 4,
-            'A');
+        std::string first(BUFFER_SIZE - 4, 'A');
 
         buf.WriteStringAndPush(first);
 
         // 消费前面一半
         uint64_t pop_len = BUFFER_SIZE / 2;
 
-        std::string popped =
-            buf.ReadAsStringAndPop(pop_len);
+        std::string popped = buf.ReadAsStringAndPop(pop_len);
 
-        assert(
-            popped ==
-            first.substr(0, pop_len));
+        assert(popped == first.substr(0, pop_len));
 
         // 尾部空间很小，但是头部存在大量空间
         // 这里应该触发 memmove
@@ -376,61 +329,39 @@ void testserver()
 
         buf.WriteStringAndPush(second);
 
-        std::string expected =
-            first.substr(pop_len) +
-            second;
+        std::string expected = first.substr(pop_len) + second;
 
-        assert(
-            buf.ReadAsString(
-                buf.ReadAbleSize()) == expected);
+        assert(buf.ReadAsString(buf.ReadAbleSize()) == expected);
 
         std::cout << "[PASS] 空间整理测试\n";
     }
 
-    // ------------------------------------------------
     // 7. 测试自动扩容
-    // ------------------------------------------------
     {
         Buffer buf;
 
-        std::string big(
-            BUFFER_SIZE * 2 + 100,
-            'X');
+        std::string big(BUFFER_SIZE * 2 + 100, 'X');
 
         buf.WriteStringAndPush(big);
 
-        assert(
-            buf.ReadAbleSize() ==
-            big.size());
-
-        assert(
-            buf.ReadAsString(big.size()) ==
-            big);
+        assert(buf.ReadAbleSize() == big.size());
+        assert(buf.ReadAsString(big.size()) == big);
 
         std::cout << "[PASS] 自动扩容测试\n";
     }
 
-    // ------------------------------------------------
     // 8. 测试 FindCRLF
-    // ------------------------------------------------
     {
         Buffer buf;
 
-        buf.WriteStringAndPush(
-            "GET / HTTP/1.1\r\n");
-
+        buf.WriteStringAndPush("GET / HTTP/1.1\r\n");
         char *pos = buf.FindCRLF();
-
         assert(pos != nullptr);
-
         assert(*pos == '\n');
-
         std::cout << "[PASS] FindCRLF 测试\n";
     }
 
-    // ------------------------------------------------
     // 9. 测试 HTTP GetLine
-    // ------------------------------------------------
     {
         Buffer buf;
 
@@ -447,83 +378,53 @@ void testserver()
         std::string line3 = buf.GetLine();
         std::string line4 = buf.GetLine();
 
-        assert(
-            line1 ==
-            "GET /index.html HTTP/1.1\r\n");
-
-        assert(
-            line2 ==
-            "Host: www.baidu.com\r\n");
-
-        assert(
-            line3 ==
-            "Content-Length: 10\r\n");
-
-        assert(
-            line4 ==
-            "\r\n");
-
+        assert(line1 == "GET /index.html HTTP/1.1\r\n");
+        assert(line2 == "Host: www.baidu.com\r\n");
+        assert(line3 == "Content-Length: 10\r\n");
+        assert(line4 == "\r\n");
         assert(buf.ReadAbleSize() == 0);
 
         std::cout << "[PASS] HTTP逐行读取测试\n";
     }
 
-    // ------------------------------------------------
     // 10. 测试不完整 HTTP 行
-    // ------------------------------------------------
     {
         Buffer buf;
 
-        buf.WriteStringAndPush(
-            "GET /index.html HTTP/1.1");
+        buf.WriteStringAndPush("GET /index.html HTTP/1.1");
 
         assert(buf.FindCRLF() == nullptr);
-
         assert(buf.GetLine() == "");
 
         // 不能因为没找到一整行就消费数据
-        assert(
-            buf.ReadAbleSize() ==
-            std::string(
-                "GET /index.html HTTP/1.1")
-                .size());
-
+        assert(buf.ReadAbleSize() == std::string("GET /index.html HTTP/1.1").size());
         std::cout << "[PASS] HTTP半包测试\n";
     }
 
-    // ------------------------------------------------
     // 11. 测试网络半包追加
-    // ------------------------------------------------
     {
         Buffer buf;
 
-        buf.WriteStringAndPush(
-            "GET /index");
+        buf.WriteStringAndPush("GET /index");
 
         // 当前没有完整行
         assert(buf.GetLine() == "");
 
         // 第二次 recv
-        buf.WriteStringAndPush(
-            ".html HTTP/1.1\r\n");
+        buf.WriteStringAndPush(".html HTTP/1.1\r\n");
 
-        assert(
-            buf.GetLine() ==
-            "GET /index.html HTTP/1.1\r\n");
+        assert(buf.GetLine() == "GET /index.html HTTP/1.1\r\n");
 
         assert(buf.ReadAbleSize() == 0);
 
         std::cout << "[PASS] HTTP半包拼接测试\n";
     }
 
-    // ------------------------------------------------
     // 12. 测试 clear
-    // ------------------------------------------------
     {
         Buffer buf;
 
-        buf.WriteStringAndPush(
-            "hello world");
+        buf.WriteStringAndPush("hello world");
 
         assert(buf.ReadAbleSize() != 0);
 
@@ -561,13 +462,17 @@ void testlog()
     FATAL_LOG(
         "监听套接字创建失败");
 }
+void testsocket()
+{
+}
 int main()
 {
     // testtimerfd();
     // testtimewheel();
     // testregex();
     // testAny();
-    testlog();
-    testserver();
+    // testlog();
+    // testserver();
+    testsocket();
     return 0;
 }
