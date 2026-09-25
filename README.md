@@ -232,7 +232,6 @@ Connection模块是对Buffer模块，Socket模块，Channel模块的一个整体
 
 
 
-
 ```mermaid
 flowchart TB
 
@@ -279,7 +278,6 @@ flowchart TB
 ```
 
 
----
 
 #### Acceptor模块
 
@@ -759,7 +757,113 @@ std::any b = std::make_any<Context>(3); // 创建并初始化一个 any
   - 发送数据；
   - 创建服务端连接；
   - 创建客户端连接；
-  -
 
+### 2.3 channel模块
+- 提供的功能有：管理 fd 事件和回调；
+- 实现思想：
+  - 1.封装对描述符的事件管理，记录描述符关心的事件类型，如可读、可写、关闭、错误等；
+  - 2.保存描述符的事件回调函数，当事件就绪时调用对应的回调函数进行处理；
+- 包含方法：
+   - 设置可读事件回调；
+   - 设置可写事件回调；
+   - 设置关闭事件回调；
+   - 设置错误事件回调；
+   - 设置任意事件回调；
+   - 获取描述符；
+   - 获取关心的事件类型；
+   - 更新事件类型；
+   - 移除事件类型;
+   - 使用epoll对管理的描述符进行事件监控；
+
+- epoll可以监听的事件：
+* `EPOLLIN`：表示 fd 当前可读，可以执行 `recv()` 或监听 fd 的 `accept()`。
+* `EPOLLOUT`：表示 fd 当前可写，可以继续执行 `send()`。
+* `EPOLLRDHUP`：表示对端关闭了连接或关闭了写方向。
+* `EPOLLPRI`：表示有高优先级的紧急数据到达。
+* `EPOLLERR`：表示 fd 发生了错误，需要进行异常处理。
+* `EPOLLHUP`：表示连接已经挂断，通常需要关闭并清理 fd。
+
+### 2.4 poller模块
+- 提供的功能有：通过epoll来监控fd的IO事件；
+- 实现思想：`Poller` 是对 `epoll` 的封装，负责：
+  - 添加/修改 fd 的事件监控
+  - 删除 fd 的事件监控
+  - 等待事件发生
+  - 根据 fd 找到对应的 `Channel`
+
+其中包含：
+
+```cpp
+int _epoll_fd;                         // epoll 操作句柄
+std::vector<epoll_event> _events;      // 保存 epoll_wait 返回的就绪事件
+std::unordered_map<int, Channel*> _channels; // fd -> Channel
+```
+```mermaid
+flowchart LR
+    A[Channel 设置 _events]
+    --> B[Poller::Update]
+    --> C[epoll_ctl 注册/修改监控]
+    --> D[内核等待 fd 就绪]
+    --> E[epoll_wait]
+    --> F[得到 epoll_event 数组]
+    --> G[根据 fd 找到 Channel]
+    --> H[设置 Channel::_revents]
+    --> I[Channel::HandleEvent]
+    --> J[执行对应回调]
+```
+
+**epoll 重要结构**
+
+- epoll_event
+
+```cpp
+struct epoll_event
+{
+    uint32_t events;    // 发生/监控的事件
+    epoll_data_t data;  // 保存与该事件关联的数据
+};
+```
+
+常用：
+
+```cpp
+epoll_event ev;
+ev.events = EPOLLIN | EPOLLOUT;
+ev.data.fd = fd;
+ev.data.ptr = channel; //也可以直接保存对象指针
+```
+
+- 创建 epoll
+
+```cpp
+int epfd = epoll_create1(0); //返回一个 epoll 文件描述符：
+```
+- 添加 / 修改 / 删除监听
+
+```cpp
+epoll_ctl(epfd, operation, fd, &event);
+//常用 operation：
+// EPOLL_CTL_ADD   // 添加
+// EPOLL_CTL_MOD   // 修改
+// EPOLL_CTL_DEL   // 删除
+```
+
+
+- 等待事件
+
+```cpp
+int n = epoll_wait(epfd,events,max_events,timeout);
+// 返回值：
+// n > 0    有 n 个 fd 就绪
+// n == 0   超时
+// n < 0    出错
+
+// 然后遍历：
+for (int i = 0; i < n; i++)
+{
+    int fd = events[i].data.fd;
+    uint32_t revents = events[i].events;
+}
+```
 
 

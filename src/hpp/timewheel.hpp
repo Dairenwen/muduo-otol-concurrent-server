@@ -37,6 +37,7 @@ private:
     std::unordered_map<uint64_t, WeakTask> _task_map; // <id, WeakTask>，用于根据定时器任务的唯一标识符快速查找定时器任务
 public:
     TimeWheel();
+    ~TimeWheel();
     void AddTask(uint64_t id, uint64_t timeout, TaskFunc task_cb);
     void RefreshTask(uint64_t id);
     void CancelTask(uint64_t id);

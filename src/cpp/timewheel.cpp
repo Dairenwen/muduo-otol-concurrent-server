@@ -22,9 +22,11 @@ uint64_t TimerTask::GetDelayTime()
 
 TimerTask::~TimerTask()
 {
-    if (!_canceled)
+    if (!_canceled && _task_cb)
         _task_cb(); // 到时间执行任务
-    _rels_cb();
+
+    if (_rels_cb)
+        _rels_cb();
 }
 
 void TimeWheel::RemoveTimer(uint64_t id)
@@ -72,4 +74,20 @@ void TimeWheel::RunTimerTask()
     _tick = (_tick + 1) % _capacity;
     // 清空当前槽位的任务，每个任务sharedptr-1，如果为0，触发析构函数执行任务
     _slots[_tick].clear();
+}
+
+TimeWheel::~TimeWheel()
+{
+    // 先取消：析构 TimerTask 时不会错误执行超时业务回调。
+    for (auto &slot : _slots)
+    {
+        for (auto &task : slot)
+        {
+            if (task)
+                task->SetCanceled();
+        }
+    }
+
+    _slots.clear();
+    _task_map.clear();
 }

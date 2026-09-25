@@ -3,7 +3,7 @@
 
 Socket::Socket(int fd) : _socket_fd(fd) {}
 
-const int Socket::GetSocketFd() const
+int Socket::GetSocketFd() const
 {
     return _socket_fd;
 }
@@ -90,15 +90,16 @@ int Socket::Accept()
     sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     // accept(): 接受客户端连接，返回新的连接 fd
-    if (accept(_socket_fd, (struct sockaddr *)(&client_addr), &client_len) < 0)
+    int client_fd = accept(_socket_fd, (struct sockaddr *)(&client_addr), &client_len);
+    if (client_fd < 0)
     {
         ERR_LOG("接受连接失败，errno = %d", errno);
         return -1;
     }
     else
     {
-        INF_LOG("接受连接成功，fd = %d", client_addr.sin_addr.s_addr);
-        return client_addr.sin_addr.s_addr; // 返回客户端 IP 地址的网络字节序表示
+        INF_LOG("接受连接成功，fd = %d", client_fd);
+        return client_fd;
     }
 }
 
@@ -117,7 +118,6 @@ ssize_t Socket::Recv(void *buf, size_t len, int flags)
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
         {
             // 非阻塞模式下，没有数据可读,或者被信号中断，返回 0 表示没有读取到数据
-            WARN_LOG("接收数据失败，errno = %d, 可能是非阻塞模式下没有数据可读或被信号中断", errno);
             return 0;
         }
         else
@@ -128,7 +128,6 @@ ssize_t Socket::Recv(void *buf, size_t len, int flags)
     }
     else
     {
-        INF_LOG("接收数据成功，fd = %d, 接收到 %zd 字节", _socket_fd, ret);
         return ret;
     }
 }
@@ -150,7 +149,6 @@ ssize_t Socket::Send(const void *buf, size_t len, int flags)
     }
     else
     {
-        INF_LOG("发送数据成功，fd = %d, 发送了 %zd 字节", _socket_fd, ret);
         return ret;
     }
 }
@@ -170,7 +168,7 @@ bool Socket::Connect(const std::string &ip, uint16_t port)
     }
 
     // sockaddr_in: 客户端连接地址，family/port/ip 都要填好
-    sockaddr_in addr{};
+    sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));          // 先清零再设置
     addr.sin_family = AF_INET;                    // IPv4
     addr.sin_port = htons(port);                  // 端口统一用网络字节序
@@ -204,7 +202,6 @@ bool Socket::CreateServer(const std::string &ip, uint16_t port)
     }
 
     SetReuseAddr(true); // 设置地址复用，timewait 状态下也能快速重启服务器
-    INF_LOG("设置地址复用成功，fd = %d", _socket_fd);
 
     if (!Bind(port, ip))
     {
@@ -212,7 +209,6 @@ bool Socket::CreateServer(const std::string &ip, uint16_t port)
         Close();
         return false;
     }
-    INF_LOG("绑定端口成功，fd = %d", _socket_fd);
 
     if (!Listen())
     {
@@ -220,7 +216,6 @@ bool Socket::CreateServer(const std::string &ip, uint16_t port)
         Close();
         return false;
     }
-    INF_LOG("监听成功，fd = %d", _socket_fd);
 
     return true;
 }
@@ -232,14 +227,14 @@ bool Socket::CreateClient(const std::string &ip, uint16_t port)
         ERR_LOG("创建套接字失败，无法创建客户端，fd = %d", _socket_fd);
         return false;
     }
-    INF_LOG("创建套接字成功，fd = %d", _socket_fd);
+
     if (!Connect(ip, port))
     {
         ERR_LOG("连接服务器失败，无法创建客户端，fd = %d", _socket_fd);
         Close();
         return false;
     }
-    INF_LOG("连接服务器成功，fd = %d", _socket_fd);
+
     return true;
 }
 

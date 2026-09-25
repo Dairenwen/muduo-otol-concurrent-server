@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <cstring>
 #include <string>
-const int BUFFER_SIZE = 100;
+#define BUFFER_SIZE 100
 
 class Buffer
 {
