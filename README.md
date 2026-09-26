@@ -865,5 +865,54 @@ for (int i = 0; i < n; i++)
     uint32_t revents = events[i].events;
 }
 ```
+### 2.5 eventLoop模块
+
+
+`eventfd` 是 Linux 提供的一种**事件通知机制**，本质上是在内核中维护一个 `uint64_t` 计数器，并返回一个文件描述符。
+
+- `write()`：向计数器写入数值，表示发生了一次事件。
+- `read()`：读取计数器中的值，并清空计数。
+- eventfd 是文件描述符，因此可以被 `epoll` 监听。
+
+eventfd 的作用是：**当 EventLoop 把耗时任务交给其他工作线程后又阻塞在 `epoll_wait()` 中时，工作线程完成任务会通过写入 eventfd 制造一个可读事件，从而唤醒 EventLoop，让它及时处理工作线程返回的结果或其他待执行任务。**
+
+
+```cpp
+#include <sys/eventfd.h>  // eventfd、EFD_NONBLOCK、EFD_CLOEXEC
+#include <unistd.h>       // read、write
+#include <cstdint>        // uint64_t
+
+// 创建 eventfd
+// 参数1：初始计数值为 0
+// EFD_NONBLOCK：设置为非阻塞模式
+// EFD_CLOEXEC：进程执行 exec 时自动关闭该 fd
+int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+// 通知 EventLoop：向 eventfd 写入一个 8 字节整数
+// 写入后，eventfd 会变成“可读”，从而唤醒 epoll_wait()
+uint64_t one = 1;
+write(fd, &one, sizeof(one));
+
+// EventLoop 被唤醒后读取 eventfd
+// 默认情况下会读出当前累计的计数值，并把计数器清零
+uint64_t value = 0;
+read(fd, &value, sizeof(value));
+
+// 使用完后关闭 eventfd
+close(fd);
+```
+
+模块大致流程如下：
+```mermaid
+flowchart TD
+    A[进入 EventLoop::Loop] --> B[epoll_wait 等待事件]
+    B --> C[获得所有就绪 fd]
+    C --> D[将对应操作封装成 Task]
+    D --> E[加入 TaskQueue]
+    E --> F[依次执行 TaskQueue 中的任务]
+    F --> G{任务是否执行完}
+    G -->|否| F
+    G -->|是| B
+```
 
 
