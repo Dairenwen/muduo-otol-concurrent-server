@@ -52,7 +52,8 @@ void testtimerfd()
 // 测试时间轮的功能
 void testtimewheel()
 {
-    TimeWheel tw;
+    EventLoop loop;
+    TimeWheel tw(&loop);
     tw.AddTask(1, 5, []()
                { cout << "Task 1 executed" << endl; });
     tw.AddTask(2, 10, []()
@@ -66,6 +67,7 @@ void testtimewheel()
         sleep(1);
     }
 }
+
 // 测试正则表达式的功能
 void testregex()
 {
@@ -655,6 +657,109 @@ void testchannel_poller()
     std::cout << "=============== All Channel/Poller Tests Passed ===============\n";
 }
 
+void test_timewheel_eventloop()
+{
+    EventLoop loop;
+    int fired = 0;
+    {
+        TimeWheel wheel(&loop);
+        wheel.AddTask(1, 1, [&fired]()
+                      { ++fired; });
+
+        std::vector<Poller::ChannelPtr> active_channels;
+        loop.GetPoller()->Poll(active_channels);
+        for (const auto &channel : active_channels)
+            channel->HandleEvent();
+
+        assert(fired == 1);
+        wheel.AddTask(2, 30, [&fired]()
+                      { ++fired; });
+        active_channels.clear();
+    }
+    assert(fired == 1);
+}
+
+void test_timewheel_thread_affinity()
+{
+    EventLoop loop;
+    TimeWheel wheel(&loop);
+    const std::thread::id loop_thread = std::this_thread::get_id();
+    int fired = 0;
+    bool callback_in_loop = false;
+
+    // 工作线程提交新增与取消。RunInLoop 只入队，不会在工作线程修改时间轮。
+    std::thread producer([&]()
+                         {
+                             wheel.AddTask(10, 2, [&]()
+                                           {
+                                               ++fired;
+                                               callback_in_loop = std::this_thread::get_id() == loop_thread;
+                                           });
+                             wheel.AddTask(20, 1, [&]() { ++fired; });
+                             wheel.CancelTask(20); });
+    producer.join();
+    assert(fired == 0);
+
+    // eventfd 唤醒 Poller；EventLoop 在自己的线程调用 RunTask，按提交顺序完成操作。
+    std::vector<Poller::ChannelPtr> active_channels;
+    loop.GetPoller()->Poll(active_channels);
+    for (const auto &channel : active_channels)
+        channel->HandleEvent();
+    loop.RunTask();
+    active_channels.clear();
+
+    wheel.RunTimerTask(); // 第 1 秒：取消的任务到期，但不能执行回调。
+    assert(fired == 0);
+
+    // 刷新发生在第 1 秒后，任务 10 应从原第 2 秒推迟到第 3 秒。
+    std::thread refresher([&]() { wheel.RefreshTask(10); });
+    refresher.join();
+    loop.RunTask();
+    wheel.RunTimerTask();
+    assert(fired == 0);
+    wheel.RunTimerTask();
+    assert(fired == 1);
+    assert(callback_in_loop);
+
+    // 即使工作线程手动推进时间轮，也要等 EventLoop 执行队列中的操作。
+    wheel.AddTask(30, 1, [&]() { ++fired; });
+    std::thread ticker([&]() { wheel.RunTimerTask(); });
+    ticker.join();
+    assert(fired == 1);
+    loop.RunTask();
+    assert(fired == 2);
+}
+
+void test_timewheel_drain_before_destruction()
+{
+    EventLoop loop;
+    int fired = 0;
+    {
+        TimeWheel wheel(&loop);
+        std::thread producer([&]() { wheel.AddTask(40, 1, [&]() { ++fired; }); });
+        producer.join();
+        // 销毁时间轮前先处理工作线程已提交的操作；此时定时任务尚未到期。
+        loop.RunTask();
+    }
+    // 时间轮析构时会取消剩余定时任务，此后队列中不应再有访问它的操作。
+    loop.RunTask();
+    assert(fired == 0);
+}
+
+void test_timewheel_requires_eventloop()
+{
+    bool rejected = false;
+    try
+    {
+        TimeWheel wheel(nullptr);
+    }
+    catch (const std::invalid_argument &)
+    {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
 int main()
 {
     // testtimerfd();
@@ -664,6 +769,10 @@ int main()
     // testlog();
     // testserver();
     // testsocket();
-    testchannel_poller();
+    // testchannel_poller();
+    test_timewheel_eventloop();
+    test_timewheel_thread_affinity();
+    test_timewheel_drain_before_destruction();
+    test_timewheel_requires_eventloop();
     return 0;
 }

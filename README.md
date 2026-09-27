@@ -495,28 +495,23 @@ struct itimerspec {
 ```
 
 - `fd`
-
   - `timerfd_create()` 返回的定时器文件描述符。
 
 - `flags`
-
   - `0`：`new_value->it_value` 表示相对时间，例如“5 秒后触发”。
   - `TFD_TIMER_ABSTIME`：表示绝对时间，例如“在某个指定时间点触发”。
   - `TFD_TIMER_CANCEL_ON_SET`：系统时间发生变化时取消定时器，通常与 `TFD_TIMER_ABSTIME` 一起使用。
 
 - `new_value`
-
   - 指向新的定时器设置。
   - `it_value`：首次触发时间。
   - `it_interval`：重复触发的时间间隔，为 `0` 表示一次性定时器。
 
 - `old_value`
-
   - 用于保存设置前的定时器配置。
   - 不需要获取旧配置时，可以传入 `NULL`。
 
 - 返回值
-
   - 成功：返回 `0`。
   - 失败：返回 `-1`，并设置 `errno`。
 
@@ -905,14 +900,30 @@ close(fd);
 模块大致流程如下：
 ```mermaid
 flowchart TD
-    A[进入 EventLoop::Loop] --> B[epoll_wait 等待事件]
-    B --> C[获得所有就绪 fd]
-    C --> D[将对应操作封装成 Task]
-    D --> E[加入 TaskQueue]
-    E --> F[依次执行 TaskQueue 中的任务]
-    F --> G{任务是否执行完}
-    G -->|否| F
-    G -->|是| B
+    A["EventLoop::StartEventLoop"] --> B["Poller::Poll / epoll_wait"]
+
+    B --> C["socket fd 就绪"]
+    C --> D["Channel::HandleEvent"]
+    D --> E["read/write/close 回调"]
+
+    B --> F["eventfd 就绪"]
+    F --> G["说明有人投递了任务"]
+
+    E --> H["RunTask"]
+    G --> H
+
+    H --> I["_tasks"]
+    I --> B
+
+    J["其他线程"] --> K["RunInLoop(task)"]
+    K --> L{"是不是 Loop 线程?"}
+    L -->|不是| M["QueueInLoop"]
+    M --> I
+    M --> N["write(eventfd)"]
+
+    L -->|是| O["直接 task()"]
+
+    P["Loop线程自己想延迟执行"] --> M
 ```
 
 

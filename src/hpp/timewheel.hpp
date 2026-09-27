@@ -1,4 +1,5 @@
 #pragma once
+#include "eventloop.hpp"
 #include <stdint.h>
 #include <functional>
 #include <memory>
@@ -30,14 +31,26 @@ class TimeWheel
     using WeakTask = std::weak_ptr<TimerTask>;  // 用于保存timertask最新的shareptr，同时不会增加引用计数
 private:
     void RemoveTimer(uint64_t id);
+    void AddTaskInLoop(uint64_t id, uint64_t timeout, TaskFunc task_cb);
+    void RefreshTaskInLoop(uint64_t id);
+    void CancelTaskInLoop(uint64_t id);
+    void RunTimerTaskInLoop();
 
-    std::vector<std::vector<PtrTask>> _slots;         // 时间轮的槽，每个槽存储多个定时器任务
-    int _tick;                                        // 时间轮秒针，表示当前时间轮的时间位置
+    EventLoop *_loop;
+    int _timerfd; // _timerfd 每秒产生一次可读事件；_timer_channel 把该事件接入 Poller，使时间轮自动前进
+    std::shared_ptr<Channel> _timer_channel;
+
     int _capacity;                                    // 时间轮的容量，即槽的数量
+    int _tick;                                        // 时间轮秒针，表示当前时间轮的时间位置
+    std::vector<std::vector<PtrTask>> _slots;         // 时间轮的槽，每个槽存储多个定时器任务
     std::unordered_map<uint64_t, WeakTask> _task_map; // <id, WeakTask>，用于根据定时器任务的唯一标识符快速查找定时器任务
 public:
-    TimeWheel();
+    TimeWheel(EventLoop *loop);
     ~TimeWheel();
+
+    TimeWheel(const TimeWheel &) = delete;
+    TimeWheel &operator=(const TimeWheel &) = delete;
+
     void AddTask(uint64_t id, uint64_t timeout, TaskFunc task_cb);
     void RefreshTask(uint64_t id);
     void CancelTask(uint64_t id);
