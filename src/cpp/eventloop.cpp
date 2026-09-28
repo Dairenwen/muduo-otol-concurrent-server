@@ -5,7 +5,8 @@ EventLoop::EventLoop()
     : _thread_id(std::this_thread::get_id()),
       _eventfd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
       _poller(),
-      _channel(nullptr)
+      _channel(nullptr),
+      _time_wheel(this)
 {
     if (_eventfd == -1)
     {
@@ -155,4 +156,24 @@ void EventLoop::RunTask()
             task();
         }
     }
+}
+
+void EventLoop::AddTask(uint64_t id, uint64_t timeout, TaskFunc task_cb)
+{
+    _time_wheel.AddTask(id, timeout, task_cb);
+}
+
+void EventLoop::RefreshTask(uint64_t id)
+{
+    _time_wheel.RefreshTask(id);
+}
+
+void EventLoop::CancelTask(uint64_t id)
+{
+    _time_wheel.CancelTask(id);
+}
+
+bool EventLoop::HasTimer(uint64_t id)
+{
+    return _time_wheel.HasTimer(id);
 }

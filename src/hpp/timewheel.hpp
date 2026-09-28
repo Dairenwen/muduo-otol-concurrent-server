@@ -1,10 +1,12 @@
 #pragma once
-#include "eventloop.hpp"
 #include <stdint.h>
 #include <functional>
 #include <memory>
 #include <vector>
 #include <unordered_map>
+
+class EventLoop;
+class Channel;
 
 using TaskFunc = std::function<void()>;
 using RelsFunc = std::function<void()>;
@@ -37,8 +39,8 @@ private:
     void RunTimerTaskInLoop();
 
     EventLoop *_loop;
-    int _timerfd; // _timerfd 每秒产生一次可读事件；_timer_channel 把该事件接入 Poller，使时间轮自动前进
-    std::shared_ptr<Channel> _timer_channel;
+    int _timerfd;                            // _timerfd 每秒产生一次可读事件；_timer_channel 把该事件接入 Poller，使时间轮自动前进
+    std::shared_ptr<Channel> _timer_channel; // 使用shareptr管理channel
 
     int _capacity;                                    // 时间轮的容量，即槽的数量
     int _tick;                                        // 时间轮秒针，表示当前时间轮的时间位置
@@ -54,5 +56,6 @@ public:
     void AddTask(uint64_t id, uint64_t timeout, TaskFunc task_cb);
     void RefreshTask(uint64_t id);
     void CancelTask(uint64_t id);
+    bool HasTimer(uint64_t id);
     void RunTimerTask();
 };

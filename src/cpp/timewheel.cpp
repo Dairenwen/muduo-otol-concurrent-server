@@ -1,4 +1,5 @@
 #include "timewheel.hpp"
+#include "eventloop.hpp"
 #include "log.hpp"
 #include <cerrno>
 #include <cstring>
@@ -10,38 +11,6 @@
 TimerTask::TimerTask(uint64_t id, uint64_t timeout, TaskFunc task_cb)
     : _id(id), _timeout(timeout), _task_cb(task_cb), _canceled(false)
 {
-}
-
-void TimerTask::SetRelsFunc(const RelsFunc &rels_cb)
-{
-    _rels_cb = rels_cb;
-}
-
-void TimerTask::SetCanceled()
-{
-    _canceled = true;
-}
-
-uint64_t TimerTask::GetDelayTime()
-{
-    return _timeout;
-}
-
-TimerTask::~TimerTask()
-{
-    if (!_canceled && _task_cb)
-        _task_cb(); // 到时间执行任务
-
-    if (_rels_cb)
-        _rels_cb();
-}
-
-void TimeWheel::RemoveTimer(uint64_t id)
-{
-    if (_task_map.find(id) != _task_map.end())
-    {
-        _task_map.erase(id);
-    }
 }
 
 TimeWheel::TimeWheel(EventLoop *loop)
@@ -95,6 +64,38 @@ TimeWheel::TimeWheel(EventLoop *loop)
     // 注册可读事件后，EventLoop 收到 timerfd 通知才会调用上面的回调。
     _timer_channel->EnableRead();
     _timer_channel->Update();
+}
+
+void TimerTask::SetRelsFunc(const RelsFunc &rels_cb)
+{
+    _rels_cb = rels_cb;
+}
+
+void TimerTask::SetCanceled()
+{
+    _canceled = true;
+}
+
+uint64_t TimerTask::GetDelayTime()
+{
+    return _timeout;
+}
+
+TimerTask::~TimerTask()
+{
+    if (!_canceled && _task_cb)
+        _task_cb(); // 到时间执行任务
+
+    if (_rels_cb)
+        _rels_cb();
+}
+
+void TimeWheel::RemoveTimer(uint64_t id)
+{
+    if (_task_map.find(id) != _task_map.end())
+    {
+        _task_map.erase(id);
+    }
 }
 
 // 防止其他线程引发线程安全问题，将任务的添加、刷新、取消和执行都放在 EventLoop 所在线程中完成。
@@ -156,6 +157,14 @@ void TimeWheel::RunTimerTaskInLoop()
     _tick = (_tick + 1) % _capacity;
     // 清空当前槽位的任务，每个任务sharedptr-1，如果为0，触发析构函数执行任务
     _slots[_tick].clear();
+}
+
+bool TimeWheel::HasTimer(uint64_t id)
+{
+    if (_task_map.find(id) != _task_map.end())
+        return true;
+    else
+        return false;
 }
 
 TimeWheel::~TimeWheel()

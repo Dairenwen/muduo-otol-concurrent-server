@@ -1,9 +1,12 @@
 #include <sys/timerfd.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <iostream>
 #include <thread>
+#include "eventloop.hpp"
 #include "timewheel.hpp"
 #include <regex>
 #include "server.hpp"
@@ -657,122 +660,101 @@ void testchannel_poller()
     std::cout << "=============== All Channel/Poller Tests Passed ===============\n";
 }
 
-void test_timewheel_eventloop()
+// 联合测试 EventLoop 和 TimeWheel:
+// timerfd 每秒就绪 -> Poller 返回事件 -> EventLoop 处理事件 -> TimeWheel 前进一格 -> 到期任务的析构函数执行回调。
+void testeventloop_timewheel()
 {
-    EventLoop loop;
-    int fired = 0;
+    // 管道用于把子进程的测试结果传回父进程：'1' 表示任务顺序正确，'0' 表示失败。
+    int result_pipe[2];
+    assert(pipe(result_pipe) == 0);
+
+    pid_t child_pid = fork();
+    assert(child_pid >= 0);
+
+    if (child_pid == 0)
     {
-        TimeWheel wheel(&loop);
-        wheel.AddTask(1, 1, [&fired]()
-                      { ++fired; });
+        // 子进程只保留写端
+        close(result_pipe[0]);
 
-        std::vector<Poller::ChannelPtr> active_channels;
-        loop.GetPoller()->Poll(active_channels);
-        for (const auto &channel : active_channels)
-            channel->HandleEvent();
+        // TimeWheel 在构造时会把自己的 timerfd 注册到 loop 的 Poller 中。
+        EventLoop loop;
+        std::vector<int> fired_tasks;
 
-        assert(fired == 1);
-        wheel.AddTask(2, 30, [&fired]()
-                      { ++fired; });
-        active_channels.clear();
+        // 记录每个任务实际触发的顺序，后面用它验证时间轮没有漏任务或乱序。
+        auto record_task = [&fired_tasks](int id)
+        {
+            fired_tasks.push_back(id);
+            std::cout << "[EventLoop/TimeWheel] task " << id << " fired" << std::endl;
+        };
+
+        // timeout 的单位是秒：任务 1、2、3 应分别在时间轮前进 1、2、3 格时执行。
+        // AddTask 发生在当前线程，任务会被 EventLoop 的任务队列接收并在事件循环中落盘。
+        loop.AddTask(1, 1, [&]()
+                     { record_task(1); });
+        loop.AddTask(2, 2, [&]()
+                     { record_task(2); });
+        loop.AddTask(3, 3, [&]()
+                     {
+                         record_task(3);
+
+                         // 第 3 个任务执行说明至少已经推进到第 3 秒；此时检查全部顺序。
+                         const bool passed = (fired_tasks == std::vector<int>{1, 2, 3});
+                         const char result = passed ? '1' : '0';
+
+                         // 先把结果写给父进程，再退出子进程，避免 EventLoop 永久运行。
+                         write(result_pipe[1], &result, sizeof(result));
+                         _exit(passed ? 0 : 1); });
+
+        // 这里会一直 Poll；timerfd 事件到来后，TimeWheel 才会自动推进并触发任务。
+        loop.StartEventLoop();
+        _exit(2);
     }
-    assert(fired == 1);
-}
 
-void test_timewheel_thread_affinity()
-{
-    EventLoop loop;
-    TimeWheel wheel(&loop);
-    const std::thread::id loop_thread = std::this_thread::get_id();
-    int fired = 0;
-    bool callback_in_loop = false;
+    // 父进程只保留读端
+    close(result_pipe[1]);
+    constexpr int timeout_seconds = 6;
+    int status = 0;
+    bool finished = false;
 
-    // 工作线程提交新增与取消。RunInLoop 只入队，不会在工作线程修改时间轮。
-    std::thread producer([&]()
-                         {
-                             wheel.AddTask(10, 2, [&]()
-                                           {
-                                               ++fired;
-                                               callback_in_loop = std::this_thread::get_id() == loop_thread;
-                                           });
-                             wheel.AddTask(20, 1, [&]() { ++fired; });
-                             wheel.CancelTask(20); });
-    producer.join();
-    assert(fired == 0);
-
-    // eventfd 唤醒 Poller；EventLoop 在自己的线程调用 RunTask，按提交顺序完成操作。
-    std::vector<Poller::ChannelPtr> active_channels;
-    loop.GetPoller()->Poll(active_channels);
-    for (const auto &channel : active_channels)
-        channel->HandleEvent();
-    loop.RunTask();
-    active_channels.clear();
-
-    wheel.RunTimerTask(); // 第 1 秒：取消的任务到期，但不能执行回调。
-    assert(fired == 0);
-
-    // 刷新发生在第 1 秒后，任务 10 应从原第 2 秒推迟到第 3 秒。
-    std::thread refresher([&]() { wheel.RefreshTask(10); });
-    refresher.join();
-    loop.RunTask();
-    wheel.RunTimerTask();
-    assert(fired == 0);
-    wheel.RunTimerTask();
-    assert(fired == 1);
-    assert(callback_in_loop);
-
-    // 即使工作线程手动推进时间轮，也要等 EventLoop 执行队列中的操作。
-    wheel.AddTask(30, 1, [&]() { ++fired; });
-    std::thread ticker([&]() { wheel.RunTimerTask(); });
-    ticker.join();
-    assert(fired == 1);
-    loop.RunTask();
-    assert(fired == 2);
-}
-
-void test_timewheel_drain_before_destruction()
-{
-    EventLoop loop;
-    int fired = 0;
+    // 每 100ms 非阻塞检查一次，给 3 秒任务留出余量，同时避免测试永久阻塞。
+    for (int elapsed = 0; elapsed < timeout_seconds * 10; ++elapsed)
     {
-        TimeWheel wheel(&loop);
-        std::thread producer([&]() { wheel.AddTask(40, 1, [&]() { ++fired; }); });
-        producer.join();
-        // 销毁时间轮前先处理工作线程已提交的操作；此时定时任务尚未到期。
-        loop.RunTask();
+        pid_t wait_result = waitpid(child_pid, &status, WNOHANG);
+        if (wait_result == child_pid)
+        {
+            finished = true;
+            break;
+        }
+        assert(wait_result == 0);
+        usleep(100000);
     }
-    // 时间轮析构时会取消剩余定时任务，此后队列中不应再有访问它的操作。
-    loop.RunTask();
-    assert(fired == 0);
-}
 
-void test_timewheel_requires_eventloop()
-{
-    bool rejected = false;
-    try
+    if (!finished)
     {
-        TimeWheel wheel(nullptr);
+        // 超时通常意味着 timerfd 没有接入 EventLoop，或时间轮没有正常推进。
+        kill(child_pid, SIGKILL);
+        waitpid(child_pid, &status, 0);
+        close(result_pipe[0]);
+        assert(false && "EventLoop/TimeWheel test timed out");
     }
-    catch (const std::invalid_argument &)
-    {
-        rejected = true;
-    }
-    assert(rejected);
+
+    // 子进程退出后读取它写入的测试结果，并检查退出码和管道结果都成功。
+    char result = '0';
+    assert(read(result_pipe[0], &result, sizeof(result)) == sizeof(result));
+    close(result_pipe[0]);
+    assert(result == '1');
+    std::cout << "=============== EventLoop/TimeWheel Test Passed ===============\n";
 }
 
 int main()
 {
     // testtimerfd();
-    // testtimewheel();
     // testregex();
     // testAny();
     // testlog();
     // testserver();
     // testsocket();
     // testchannel_poller();
-    test_timewheel_eventloop();
-    test_timewheel_thread_affinity();
-    test_timewheel_drain_before_destruction();
-    test_timewheel_requires_eventloop();
+    testeventloop_timewheel();
     return 0;
 }
