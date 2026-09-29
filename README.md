@@ -949,4 +949,31 @@ flowchart TD
    - 连接关闭回调
    - 任意时间处理回调
 
+Connection模块大致流程如下：
+```mermaid
+flowchart TD
+    A[Server accept 得到 fd] --> B[创建 Connection]
+    B --> C[设置连接/消息/关闭回调]
+    C --> D[Established]
+    D --> E[开启 EPOLLIN 读事件]
 
+    E --> F{发生什么事件？}
+    F -->|可读 EPOLLIN| G[HandleRead]
+    G --> H[循环 recv 数据]
+    H --> I[写入 InBuffer]
+    I --> J[调用 MessageCallback]
+
+    F -->|业务调用 Send| K[写入 OutBuffer]
+    K --> L[开启 EPOLLOUT 写事件]
+    F -->|可写 EPOLLOUT| M[HandleWrite]
+    M --> N[send 输出缓冲区数据]
+    N --> O{是否发送完？}
+    O -->|否| L
+    O -->|是| P[关闭 EPOLLOUT]
+
+    F -->|对端关闭 / 出错| Q[HandleClose]
+    Q --> R[Release]
+    R --> S[移除 Channel]
+    S --> T[关闭 socket]
+    T --> U[调用 CloseCallback]
+```
