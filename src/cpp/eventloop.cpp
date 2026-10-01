@@ -124,7 +124,7 @@ void EventLoop::RemoveEventfd(Channel *ch)
 void EventLoop::StartEventLoop()
 {
     std::vector<Poller::ChannelPtr> active_channels;
-    for (;;)
+    while (!_quit)
     {
         // 1. 等待 fd 发生事件
         _poller.Poll(active_channels);
@@ -138,6 +138,15 @@ void EventLoop::StartEventLoop()
         // 3. 执行 EventLoop 任务队列
         RunTask();
     }
+}
+
+void EventLoop::StopEventLoop()
+{
+    // 跨线程时入队并写 eventfd，唤醒 epoll_wait；_quit 始终在 Loop 线程修改。
+    RunInLoop([this]()
+              {
+                  _quit = true;
+                  DBG_LOG("EventLoop 收到停止请求，本轮结束后退出"); });
 }
 
 void EventLoop::RunTask()

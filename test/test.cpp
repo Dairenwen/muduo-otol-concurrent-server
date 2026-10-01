@@ -9,6 +9,7 @@
 #include "poller.hpp"
 #include "connection.hpp"
 #include "acceptor.hpp"
+#include "loopthread.hpp"
 #include <vector>
 #include <assert.h>
 #include <memory>
@@ -23,6 +24,8 @@
 #include <thread>
 #include <regex>
 #include <stdexcept>
+#include <unordered_map>
+#include <cerrno>
 using namespace std;
 
 // 测试时间轮的timerfd功能
@@ -838,86 +841,274 @@ void testconnection()
 
 void testacceptor()
 {
-    // 子进程运行 Acceptor；两个管道分别传回监听端口和测试结果。
+    // 测试分工：父进程是 TCP 客户端；子进程是一个有主/子 Reactor 的小服务端。
+    // 子进程主线程：EventLoop -> Poller -> 监听 Channel -> Acceptor -> accept。
+    // 子进程工作线程：LoopThread -> EventLoop -> Connection -> Buffer -> 回显/关闭。
+    // 两个 Loop 之间用 QueueInLoop + eventfd 交接任务，不直接跨线程操作 Poller。
+    auto require = [](bool ok, const char *message)
+    {
+        // 不使用 assert 做有副作用的操作：Release 编译下 assert 会被移除。
+        if (!ok)
+            throw std::runtime_error(message);
+    };
+
+    // 只需要一个管道传递端口；最终服务端是否通过，由子进程退出码表示。
     int port_pipe[2];
-    int result_pipe[2];
-    if (pipe(port_pipe) != 0 || pipe(result_pipe) != 0)
-        throw std::runtime_error("Acceptor test pipe failed");
+    require(pipe(port_pipe) == 0, "Acceptor test pipe failed");
 
     std::cout.flush();
     pid_t child = fork();
-    if (child < 0)
-        throw std::runtime_error("Acceptor test fork failed");
+    require(child >= 0, "Acceptor test fork failed");
 
     if (child == 0)
     {
         close(port_pipe[0]);
-        close(result_pipe[0]);
-        alarm(5); // EventLoop 没有停止接口，失败时由 alarm 结束子进程。
+        alarm(12); // 仅作为失败兜底；正常路径会 StopEventLoop、join，然后退出。
+        try
+        {
+            EventLoop main_loop;   // 在主线程构造，也在主线程启动。
+            unsigned accepted = 0; // 仅主线程修改。
 
-        EventLoop loop;
-        // port=0 表示让内核分配一个可用端口，避免测试固定占用某个端口。
-        Acceptor acceptor(&loop, "127.0.0.1", 0);
+            // 以下状态仅工作线程修改；主线程在 worker 析构/join 后才读取。
+            // 先声明状态，再声明 worker，保证回调引用的变量比工作线程活得更久。
+            std::unordered_map<uint64_t, ConnPtr> connections;
+            unsigned connected = 0, closed = 0, frames = 0, events = 0;
+            size_t echoed_bytes = 0;
+            bool idle_timer_seen = false;
+            struct RequestState
+            {
+                std::string pending; // 保存尚未遇到换行符的半条消息。
+                unsigned frames = 0;
+            };
 
-        // 读取内核实际分配的端口，并通知父进程去连接它。
-        sockaddr_in addr{};
-        socklen_t addr_len = sizeof(addr);
-        if (getsockname(acceptor.GetListenSocketFd(), reinterpret_cast<sockaddr *>(&addr), &addr_len) != 0)
-            _exit(2);
-        const uint16_t port = ntohs(addr.sin_port);
-        if (port == 0 || write(port_pipe[1], &port, sizeof(port)) != sizeof(port))
-            _exit(3);
-        close(port_pipe[1]);
+            {
+                LoopThread worker;
+                EventLoop *worker_loop = worker.GetLoop(); // worker 构造已等待就绪，这里获取指针。
+                require(!worker_loop->IsInLoopThread(), "Worker Loop belongs to main thread");
+                Acceptor acceptor(&main_loop, "127.0.0.1", 0);
 
-        // 客户端 connect 后，监听 fd 可读，Channel 会调用 Acceptor::HandleRead。
-        acceptor.SetAcceptCallbak([&result_pipe](int client_fd)
-                                  {
-            const char result = client_fd >= 0 ? '1' : '0';
-            if (client_fd >= 0)
-                close(client_fd); // 此测试只验证 accept；client_fd 不再交给 Connection。
-            write(result_pipe[1], &result, sizeof(result));
-            _exit(result == '1' ? 0 : 4); });
+                acceptor.SetAcceptCallbak([&](int client_fd)
+                                          {
+                    require(main_loop.IsInLoopThread(), "accept ran outside main Loop");
+                    const uint64_t id = ++accepted;
+                    require(id <= 3, "Unexpected extra client");
+                    INF_LOG("[联合测试] 主 Loop 接收连接 id=%llu，投递到工作 Loop",
+                            static_cast<unsigned long long>(id));
 
-        loop.StartEventLoop();
-        _exit(5);
+                    // 值捕获 fd/id，避免 accept 回调结束后局部变量失效。
+                    // QueueInLoop 负责写 eventfd；工作 Loop 被唤醒后才执行这个 lambda。
+                    worker_loop->QueueInLoop([&, client_fd, id, worker_loop]()
+                    {
+                        require(worker_loop->IsInLoopThread(), "Connection setup ran in wrong thread");
+                        auto conn = std::make_shared<Connection>(worker_loop, client_fd, id);
+                        // map 持有连接：Channel 的回调使用 weak_ptr，本身不会保活 Connection。
+                        connections.emplace(id, conn);
+                        conn->GetContext() = RequestState{}; // 同时验证 Any 保存协议状态。
+
+                        conn->SetConnectedCallback([&, worker_loop](const ConnPtr &current)
+                        {
+                            require(worker_loop->IsInLoopThread(), "connected callback in wrong thread");
+                            require(current->GetConnStatu() == CONNECTED, "Connection not established");
+                            ++connected;
+                            // 第 3 条连接故意不发送业务数据，2 秒无活动后由时间轮关闭。
+                            // 前两条也有定时器，正常关闭时应取消；Any 事件会刷新存活时间。
+                            current->SetInactiveClose(true, current->GetConnId() == 3 ? 2 : 8);
+                            if (current->GetConnId() == 3)
+                                idle_timer_seen = worker_loop->HasTimer(3);
+                            current->Send("ready\n"); // 客户端收到它，说明连接已建立。
+                            INF_LOG("[联合测试] 工作 Loop 建立连接 id=%llu",
+                                    static_cast<unsigned long long>(current->GetConnId()));
+                        });
+
+                        conn->SetMessageCallback([&, worker_loop](const ConnPtr &current, Buffer &buffer)
+                        {
+                            require(worker_loop->IsInLoopThread(), "message callback in wrong thread");
+                            require(current->GetConnId() == 1, "Unexpected message from idle/closing client");
+                            auto state = current->GetContext().get<RequestState>();
+                            require(state != nullptr, "Any protocol context lost");
+                            // TCP 只有字节流：一次 recv 可能是半条，也可能是多条消息。
+                            // 先消费 Buffer 中的字节，再以 '\n' 划分完整消息，不能假设一次 recv == 一条。
+                            state->pending += buffer.ReadAsStringAndPop(buffer.ReadAbleSize());
+                            size_t end;
+                            while ((end = state->pending.find('\n')) != std::string::npos)
+                            {
+                                const std::string frame = state->pending.substr(0, end + 1);
+                                state->pending.erase(0, end + 1);
+                                ++state->frames;
+                                ++frames;
+                                echoed_bytes += frame.size();
+                                current->Send(frame); // 写入输出 Buffer，等待 EPOLLOUT 真正发送。
+                                INF_LOG("[联合测试] 回显第 %u 条消息，字节数=%zu", state->frames, frame.size());
+                                if (state->frames == 2)
+                                {
+                                    // 此时输出 Buffer 还有数据：Shutdown 应等回显发完后再关闭 fd。
+                                    current->Shutdown();
+                                }
+                                require(state->frames <= 2, "Unexpected extra message");
+                            }
+                        });
+
+                        conn->SetAnyCallback([&, worker_loop](const ConnPtr &)
+                        {
+                            require(worker_loop->IsInLoopThread(), "event callback in wrong thread");
+                            ++events; // Channel 的任意事件回调走到了 Connection。
+                        });
+
+                        conn->SetCloseCallback([&, worker_loop](const ConnPtr &current)
+                        {
+                            require(worker_loop->IsInLoopThread(), "close callback in wrong thread");
+                            require(current->GetConnStatu() == DISCONNECTED, "Connection not released");
+                            require(current->GetSocketfd() == -1, "Connection fd was not closed");
+                            require(connections.erase(current->GetConnId()) == 1, "Duplicate close callback");
+                            ++closed;
+                            INF_LOG("[联合测试] 连接 id=%llu 已关闭，累计关闭=%u",
+                                    static_cast<unsigned long long>(current->GetConnId()), closed);
+                            // 所有连接均已移除；跨线程投递停止请求，唤醒主 Loop 的 epoll_wait。
+                            if (closed == 3) main_loop.StopEventLoop();
+                        });
+                        conn->Established(); // 已在所属线程，立即注册连接 Channel 的读监听。
+                    }); });
+
+                // port=0 让内核选择空闲端口；在安装好回调以后再告诉客户端。
+                sockaddr_in addr{};
+                socklen_t addr_len = sizeof(addr);
+                require(getsockname(acceptor.GetListenSocketFd(), reinterpret_cast<sockaddr *>(&addr), &addr_len) == 0,
+                        "getsockname failed");
+                const uint16_t port = ntohs(addr.sin_port);
+                require(port != 0 && write(port_pipe[1], &port, sizeof(port)) == sizeof(port), "Port handoff failed");
+                close(port_pipe[1]);
+                main_loop.StartEventLoop(); // 主线程在这里等待 accept，直到第 3 个关闭回调请求停止。
+            } // 先销毁 Acceptor；再析构 worker，停止工作 Loop 并 join。
+
+            // join 建立了同步关系：现在读取工作线程的计数和 map 无需再加锁。
+            require(accepted == 3 && connected == 3 && closed == 3, "Connection lifecycle counts mismatch");
+            require(connections.empty(), "Connections were not released");
+            require(frames == 2 && echoed_bytes == 6 + 128 * 1024 + 1, "Echo byte/frame counts mismatch");
+            require(events > 0 && idle_timer_seen, "Channel callback or TimeWheel was not exercised");
+            INF_LOG("[联合测试] 服务端验证通过，两个 Loop 和工作线程已正常退出");
+        }
+        catch (const std::exception &error)
+        {
+            ERR_LOG("[联合测试] 服务端失败：%s", error.what());
+            _exit(1);
+        }
+        // 到这里对象已按作用域正常析构；_exit 只结束测试子进程。
+        alarm(0);
+        _exit(0);
     }
 
     close(port_pipe[1]);
-    close(result_pipe[1]);
+    std::exception_ptr client_error;
+    try
+    {
+        uint16_t port = 0;
+        require(read(port_pipe[0], &port, sizeof(port)) == sizeof(port) && port != 0, "No listening port received");
 
-    uint16_t port = 0;
-    if (read(port_pipe[0], &port, sizeof(port)) != sizeof(port) || port == 0)
-        throw std::runtime_error("Acceptor did not provide a listening port");
+        auto connect_client = [&](Socket &client)
+        {
+            require(client.CreateClient("127.0.0.1", port), "Client connect failed");
+            timeval timeout{};
+            timeout.tv_sec = 6;
+            // 收发均限时，服务端出错时不会永久卡在 send/recv。
+            require(setsockopt(client.GetSocketFd(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+                    "Receive timeout setup failed");
+            require(setsockopt(client.GetSocketFd(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0,
+                    "Send timeout setup failed");
+        };
+        auto send_all = [&](Socket &client, const std::string &message)
+        {
+            // send 可能只发出部分字节，必须循环；MSG_NOSIGNAL 防止断连时 SIGPIPE 终止测试。
+            size_t sent = 0;
+            while (sent < message.size())
+            {
+                const ssize_t n = client.Send(message.data() + sent, message.size() - sent, MSG_NOSIGNAL);
+                if (n < 0 && errno == EINTR)
+                    continue;
+                require(n > 0, "Client send failed or timed out");
+                sent += static_cast<size_t>(n);
+            }
+        };
+        auto receive_exact = [&](Socket &client, const std::string &expected)
+        {
+            // recv 也可能只收到一部分；累计到预期长度后，再逐字节比较。
+            std::string actual(expected.size(), '\0');
+            size_t received = 0;
+            while (received < actual.size())
+            {
+                const ssize_t n = client.Recv(&actual[received], actual.size() - received);
+                if (n < 0 && errno == EINTR)
+                    continue;
+                require(n > 0, "Client recv failed, timed out or reached early EOF");
+                received += static_cast<size_t>(n);
+            }
+            require(actual == expected, "Echo content mismatch");
+        };
+        auto expect_eof = [&](Socket &client)
+        {
+            char byte;
+            ssize_t n;
+            do
+            {
+                n = client.Recv(&byte, 1);
+            } while (n < 0 && errno == EINTR);
+            // 只有 0 表示正常关闭；-1 超时/错误不能当成关闭成功。
+            require(n == 0, "Expected EOF after server close");
+        };
+
+        {
+            Socket client;
+            connect_client(client);
+            receive_exact(client, "ready\n");
+            send_all(client, "hel");
+            send_all(client, "lo\n"); // 分两次发送；TCP 仍可能合并，因此服务端统一按换行解析。
+            receive_exact(client, "hello\n");
+            const std::string large_message = std::string(128 * 1024, 'x') + '\n';
+            send_all(client, large_message); // 大于 Connection 一次 recv 的 64 KiB 缓冲区。
+            receive_exact(client, large_message);
+            expect_eof(client); // 验证 Shutdown 确实等 128 KiB 回显全部发完才关闭。
+            std::cout << "[PASS] 分段消息、大消息回显、发送完毕后关闭\n";
+        }
+        {
+            Socket client;
+            connect_client(client);
+            receive_exact(client, "ready\n");
+            client.Close(); // 客户端主动关闭；服务端应读到 EOF 并只执行一次关闭回调。
+            std::cout << "[PASS] 客户端主动断开（服务端退出前会检查关闭计数）\n";
+        }
+        {
+            Socket client;
+            connect_client(client);
+            receive_exact(client, "ready\n");
+            // 不发业务消息、不主动断开；必须由工作 Loop 的 timerfd/TimeWheel 关闭。
+            expect_eof(client);
+            std::cout << "[PASS] TimeWheel 关闭空闲连接\n";
+        }
+    }
+    catch (...)
+    {
+        client_error = std::current_exception();
+        kill(child, SIGKILL); // 失败时结束本测试的子进程，随后 waitpid，避免遗留进程。
+    }
     close(port_pipe[0]);
-
-    // 父进程模拟客户端；connect 成功后会使子进程的监听 socket 变为可读。
-    Socket client;
-    if (!client.CreateClient("127.0.0.1", port))
-        throw std::runtime_error("Acceptor test client connect failed");
-
-    char result = '0';
-    const bool accepted = read(result_pipe[0], &result, sizeof(result)) == sizeof(result) && result == '1';
-    close(result_pipe[0]);
-
     int status = 0;
     const bool child_ok = waitpid(child, &status, 0) == child &&
                           WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!accepted || !child_ok)
-        throw std::runtime_error("Acceptor test failed");
-
-    std::cout << "[PASS] Acceptor: listen -> accept -> callback\n";
+    if (client_error)
+        std::rethrow_exception(client_error);
+    require(child_ok, "Integrated server checks failed or timed out");
+    std::cout << "[PASS] Acceptor + LoopThread + EventLoop + Poller + Channel + Connection + Buffer + Any + TimeWheel\n";
 }
 
 int main()
 {
     // testtimerfd();
-    // testregex();
-    // testAny();
-    // testlog();
-    // testserver();
-    // testsocket();
-    // testchannel_poller();
-    // testeventloop_timewheel();
+    testregex();
+    testAny();
+    testlog();
+    testserver();
+    testsocket();
+    testchannel_poller();
+    testeventloop_timewheel();
     testconnection();
     testacceptor();
     return 0;

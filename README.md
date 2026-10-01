@@ -987,3 +987,185 @@ flowchart TD
   4. 为新链接创建Connection进行管理，调用新链接回调函数；
 
 总结：`Acceptor` 监听监听 socket，有新连接时通过 `accept()` 得到已连接的 `client_fd`，用它构造 `Connection`，再由 `Connection` 的 `Channel` 注册到 `Poller` 管理后续读写与关闭事件。
+
+### 2.8 LoopThread模块
+
+`LoopThread` 封装一个工作线程，在该线程中构造、运行并销毁 `EventLoop`，为子 Reactor 提供运行环境。一个子 Reactor 可以管理多条连接。
+
+功能设计：
+
+1. **创建线程**：构造函数启动 `_thread`，子线程执行 `ThreadEntry()`。
+2. **构造 Loop**：子线程创建局部 `EventLoop`，把地址保存到 `_loop`，再通知等待方。构造函数等到指针发布才返回，此时不保证事件循环已经开始运行。
+3. **获取 Loop**：`GetLoop()` 加锁读取 `_loop`，供其他线程投递任务；循环结束后返回 `nullptr`。
+4. **回收线程**：析构函数请求停止 Loop，释放锁后调用 `join()` 等待子线程退出。Loop 随子线程中的局部对象销毁。
+
+| 成员 | 作用 |
+| --- | --- |
+| `_thread` | 承载事件循环的工作线程 |
+| `_loop` | 指向子线程中的 EventLoop，不拥有对象 |
+| `_mutex` | 保护 `_loop` 的跨线程读写；只读也须防止另一个线程同时写 |
+| `_cond` | 让构造函数等待 Loop 发布；等待时释放锁，被唤醒后重新加锁检查条件 |
+
+在主从 Reactor 模型中，主 Reactor 接收新连接，子 Reactor 处理连接的后续读写。两者都有 `EventLoop + Poller + Channel`，职责由各自注册的 fd 和回调决定。当前联合测试包含一个主 Reactor、一个子 Reactor。
+
+```mermaid
+flowchart TD
+    C[客户端 connect] --> A
+    subgraph MAIN[主线程：主 Reactor]
+        A[监听 fd 就绪] --> B[Poller → Channel → Acceptor]
+        B --> D[accept 获取新连接 fd]
+    end
+    D -->|QueueInLoop 投递任务，eventfd 唤醒| E
+    subgraph WORK[LoopThread 工作线程：子 Reactor]
+        E[创建 Connection，设置回调] --> F[Established 注册连接 fd]
+        F --> G[Poller → Channel → Connection]
+        G --> H[读取 → 输入 Buffer → 消息回调]
+        H --> I[Send → 输出 Buffer → 可写时发送]
+    end
+    I --> R[客户端收到响应]
+```
+
+跨线程交接的是 **fd 和待执行的函数**，两个线程共享进程中的 fd，无需重新连接。`eventfd` 只负责唤醒，具体操作保存在目标 Loop 的任务队列中。
+
+- `RunInLoop(task)`：调用者就是目标 Loop 的所属线程时立即执行，否则排队并唤醒目标线程。
+- `QueueInLoop(task)`：无论调用者在哪个线程，都先排队；队列保存函数，不保存线程。
+- `TimeWheel`：通过 timerfd 事件推进，负责空闲超时关闭；`Any` 保存每条连接的协议上下文。
+
+开发到重新理清一下思路：
+
+**先看整体：主、子 Reactor 分别在哪里**
+
+```mermaid
+flowchart TB
+    C["客户端"]
+
+    subgraph MAIN["主线程：主 Reactor"]
+        ML["主 EventLoop<br/>不断等待并处理事件"]
+        MP["主 Poller：封装 epoll<br/>监控监听 socket"]
+        AC["监听 Channel → Acceptor<br/>accept 获取新连接 fd"]
+        ML --> MP --> AC
+    end
+
+    subgraph WORK["工作线程：子 Reactor，由 LoopThread 创建"]
+        WL["工作 EventLoop<br/>处理事件与任务队列"]
+        WP["工作 Poller：独立的 epoll<br/>监控已建立连接"]
+        CON["各连接的 Channel → Connection<br/>读取、处理、发送、关闭"]
+        WL --> WP --> CON
+    end
+
+    C -->|"connect：请求建立连接"| MP
+    AC -->|"QueueInLoop：投递创建 Connection 的任务<br/>写 eventfd，唤醒工作 Loop"| WL
+    C <-->|"连接建立后的业务数据"| CON
+```
+
+
+`LoopThread` 则负责创建线程，让这个线程拥有并运行自己的 `EventLoop`。
+
+| 模型 | 接收连接 | 连接读写 | 业务处理 |
+|---|---|---|---|
+| 单 Reactor 单线程 | 同一个线程 | 同一个线程 | 同一个线程 |
+| 单 Reactor 多线程 | 一个 Reactor 线程 | 同一个 Reactor 线程 | 通常交给业务线程池 |
+| **主从 Reactor 多线程** | **主 Reactor 线程** | **各子 Reactor 线程** | 当前代码在所属子 Reactor 中执行 |
+
+
+**一个子 Reactor 可以管理很多条连接，并不是一条连接创建一个线程。** 当前 `Server` 文件还是空的，线程池和完整服务端封装尚未实现。
+
+**再看各模块：它们各负责哪一步**
+
+| 模块 | 职责 |
+|---|---|
+| `Socket` | 封装创建、监听、accept、recv、send、关闭 |
+| `Acceptor` | 管理监听 socket，接收新连接，把新 fd 交出去 |
+| `Connection` | 管理一条已建立连接的状态、收发和关闭 |
+| `Channel` | 记录一个 fd 关心哪些事件，以及事件发生后调用什么回调 |
+| `Poller` | 用 epoll 等待事件，找出哪些 Channel 就绪 |
+| `EventLoop` | 不断调用 Poller、分发事件、执行排队任务 |
+| `LoopThread` | 创建线程，在该线程中构造并运行 EventLoop |
+| `Buffer` | 保存收到的数据、等待发送的数据 |
+| `Any` | 保存每条连接的协议上下文，例如尚未收完整的消息 |
+| `TimeWheel` | 管理定时任务，例如关闭长期没有活动的连接 |
+
+每个 Loop 内部反复做的是：
+
+```mermaid
+flowchart LR
+    P["Poller 等待事件<br/>epoll_wait"] --> CH["找到就绪 Channel"]
+    CH --> CB["Channel 调用回调<br/>接收连接 / 读写 / 定时"]
+    CB --> T["RunTask<br/>执行其他线程投递的任务"]
+    T --> P
+```
+
+**最后跟着一条连接走一遍**
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant M as 主线程：主 Reactor
+    participant W as 工作线程：子 Reactor
+
+    C->>M: ① connect 请求建立连接
+    Note over M: 内核完成 TCP 握手后<br/>监听 socket 可读
+    M->>M: ② Poller → 监听 Channel → Acceptor
+    M->>M: ③ accept 得到 client_fd
+    M->>W: ④ QueueInLoop 投递任务，并写 eventfd
+    W->>W: ⑤ 创建 Connection，设置回调
+    W->>W: ⑥ Established 注册连接 fd 的读监听
+
+    C->>W: ⑦ 发送业务数据
+    W->>W: Poller → 连接 Channel → HandleRead
+    W->>W: recv → 输入 Buffer → 消息回调
+    W->>W: 解析消息，生成响应，调用 Send
+    Note over W: Send 先写输出 Buffer<br/>并开启 EPOLLOUT 监听
+    W->>W: 可写事件 → HandleWrite → send
+    W->>C: ⑧ 发送响应数据
+
+    Note over C,W: 后续读写一直由这个子 Reactor 处理
+    W->>W: ⑨ 断开、主动关闭或空闲超时
+    W->>W: 移除监听、关闭 fd、执行关闭回调
+```
+
+有几个容易混淆的地方：
+
+- **监听 fd 和连接 fd 是两种不同用途的 fd。** 监听 fd 一直归 `Acceptor` 管；每次 `accept()` 返回一个新的连接 fd，交给一个 `Connection` 管。
+- **主线程交给工作线程的是 fd 和任务。** 两个线程处于同一个进程，共享文件描述符，不需要再次建立 TCP 连接。
+- **`eventfd` 传递的是唤醒通知。** 真正要执行的创建连接、发送等操作保存在任务队列中。
+- **`Send()` 不保证数据已经发出。** 数据先进入输出 Buffer，等可写事件触发后，由 `HandleWrite()` 发送；未发完的部分继续保留。
+- **TCP 传递的是字节流。** 消息可能分几次到达，所以 Buffer 暂存字节，消息回调负责判断一条消息是否完整。当前测试以换行符作为消息边界。
+
+`TimeWheel` 也通过同一个事件循环工作：
+
+```mermaid
+flowchart LR
+    TIMER["timerfd 每秒可读"] --> P["工作 Poller"]
+    P --> CH["定时器 Channel"]
+    CH --> TW["TimeWheel 前进一格"]
+    TW --> CLOSE["空闲任务到期<br/>关闭对应 Connection"]
+```
+
+当前连接发生活动时会刷新空闲任务，正常关闭时会取消任务。**接收连接走主 Loop，连接收发和空闲超时走所属工作 Loop**
+
+
+### 2.9 LoopThread线程池开发
+
+- 主要功能：管理工作线程，为新连接分配 EventLoop、**配置工作线程数量、管理 `LoopThread` 对象、为新连接选择所属的 `EventLoop`。**
+
+`LoopThread` 提供一个工作线程及其 EventLoop；`LoopThreadPool` 将多个 `LoopThread` 组织起来，让主 Reactor 能把连接分给不同的子 Reactor。
+
+
+**分配连接**
+
+- **工作线程为 0**：`NextLoop()` 返回主 Loop，由主线程同时接收连接、处理读写，形成单 Reactor 单线程模型。
+- **工作线程大于 0**：使用轮询（Round Robin，简称 RR）分配。例如三个工作 Loop 的分配顺序是：`A → B → C → A → B → C`。
+
+```mermaid
+flowchart TD
+    A[主 Reactor accept 得到新连接 fd] --> B[线程池 NextLoop]
+    B --> C{有工作线程吗？}
+    C -->|没有| D[选择主 EventLoop]
+    C -->|有| E[轮询选择一个工作 EventLoop]
+    D --> F[在选中的 Loop 中创建并建立 Connection]
+    E --> F
+    F --> G[该 Loop 持续处理连接的读写与关闭]
+```
+
+调用方获取 Loop 后，通过 `RunInLoop()` 或 `QueueInLoop()` 将连接初始化操作交给它执行。**线程池负责选择 Loop，连接的创建和回调设置由上层负责。**
