@@ -1,24 +1,28 @@
+#include "eventloop.hpp"
+#include "timewheel.hpp"
+#include "server.hpp"
+#include "buffer.hpp"
+#include "any.hpp"
+#include "log.hpp"
+#include "socket.hpp"
+#include "channel.hpp"
+#include "poller.hpp"
+#include "connection.hpp"
+#include "acceptor.hpp"
+#include <vector>
+#include <assert.h>
+#include <memory>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 #include <signal.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <iostream>
 #include <thread>
-#include "eventloop.hpp"
-#include "timewheel.hpp"
 #include <regex>
-#include "server.hpp"
-#include "buffer.hpp"
-#include <assert.h>
-#include "any.hpp"
-#include "log.hpp"
-#include "socket.hpp"
-#include "channel.hpp"
-#include "poller.hpp"
-#include <vector>
-#include <memory>
+#include <stdexcept>
 using namespace std;
 
 // 测试时间轮的timerfd功能
@@ -746,6 +750,164 @@ void testeventloop_timewheel()
     std::cout << "=============== EventLoop/TimeWheel Test Passed ===============\n";
 }
 
+void testconnection()
+{
+    // 1. 创建两个已经互相连通的 socket，fds[0] 交给 Connection，fds[1] 用来模拟客户端。
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+        throw std::runtime_error("socketpair failed");
+
+    std::cout.flush();
+    pid_t child = fork();
+    if (child < 0)
+        throw std::runtime_error("fork failed");
+
+    if (child == 0)
+    {
+        // 子进程模拟服务端，只保留 fds[0]。
+        close(fds[1]);
+        alarm(5); // 5 秒还没有结束就终止子进程，父进程会把这种退出判断为失败。
+
+        // loop 在子进程主线程创建，也在这个线程运行。
+        // Connection 创建后处于 CONNECTING，此时还没有监听连接的可读事件。
+        EventLoop loop;
+        auto conn = std::make_shared<Connection>(&loop, fds[0], 1);
+        std::string request; // 累积收到的数据：一次 recv 不保证拿到完整的 hello。
+
+        conn->SetMessageCallback([&request](const ConnPtr &current, Buffer &buffer)
+                                 {
+            // 取出目前收到的数据并移动读指针，避免下一次重复处理同一段数据。
+            request += buffer.ReadAsStringAndPop(buffer.ReadAbleSize());
+            if (request.size() > 5) _exit(2);
+            if (request == "hello")
+            {
+                // 这里已经在 loop 线程：Send 会立即执行 SendInLoop。
+                // world 先放进输出缓冲区并开启写事件，不是在这里直接发到客户端。
+                current->Send("world");
+                // Shutdown 将状态改为 DISCONNECTING。
+                // 输出缓冲区还有 world，所以等待 HandleWrite 发完后再 Release。
+                current->Shutdown();
+            } });
+        // Release 已关闭 fd 并设为 DISCONNECTED 后，才调用这个关闭回调。
+        // EventLoop 没有停止接口，因此用 _exit 结束测试子进程；0 表示成功。
+        conn->SetCloseCallback([](const ConnPtr &current)
+                               { _exit(current->GetConnStatu() == DISCONNECTED ? 0 : 3); });
+
+        // worker 是另一个线程，Established 会把 EstablishedInLoop 放进 loop 的队列。
+        // worker.join() 只等 worker 完成投递，不代表 EstablishedInLoop 已经执行。
+        std::thread worker([conn]
+                           { conn->Established(); });
+        worker.join();
+        // 开始事件循环：处理 eventfd 的唤醒，再执行队列中的 EstablishedInLoop。
+        // 它将状态改为 CONNECTED 并监听读事件，之后才能走 HandleRead/HandleWrite。
+        loop.StartEventLoop();
+        _exit(4); // 当前事件循环不应返回；如果返回，测试判为失败。
+    }
+
+    // 父进程模拟客户端，只保留 fds[1]
+    close(fds[0]);
+    // recv 最多等待 7 秒，防止测试一直阻塞。
+    timeval timeout{};
+    timeout.tv_sec = 7;
+    if (setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+        throw std::runtime_error("receive timeout setup failed");
+
+    // 发送请求。即使子进程还没开启读监听，数据也会先保存在内核缓冲区中。
+    if (send(fds[1], "hello", 5, 0) != 5)
+        throw std::runtime_error("sending hello failed");
+
+    char response[5];
+    // 等服务端回复；MSG_WAITALL 尽量收满 5 字节，遇到关闭/超时也可能提前返回。
+    ssize_t received = recv(fds[1], response, sizeof(response), MSG_WAITALL);
+    // response 没有字符串结束符，所以用 std::string(response, 5) 指定长度。
+    bool reply_ok = received == 5 && std::string(response, 5) == "world";
+    // 再读一次应返回 0，验证服务端发完 world 后确实关闭了连接。
+    ssize_t after_response = recv(fds[1], response, sizeof(response), 0);
+    close(fds[1]);
+
+    int status = 0;
+    // 等子进程结束，同时检查回复、EOF 和退出码。
+    // 若子进程被 alarm 终止，即使客户端收到 EOF，也不会被误认为测试成功。
+    if (waitpid(child, &status, 0) != child ||
+        !reply_ok || after_response != 0 ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        throw std::runtime_error("Connection test failed");
+
+    std::cout << "[PASS] Connection: hello -> world -> close\n";
+}
+
+void testacceptor()
+{
+    // 子进程运行 Acceptor；两个管道分别传回监听端口和测试结果。
+    int port_pipe[2];
+    int result_pipe[2];
+    if (pipe(port_pipe) != 0 || pipe(result_pipe) != 0)
+        throw std::runtime_error("Acceptor test pipe failed");
+
+    std::cout.flush();
+    pid_t child = fork();
+    if (child < 0)
+        throw std::runtime_error("Acceptor test fork failed");
+
+    if (child == 0)
+    {
+        close(port_pipe[0]);
+        close(result_pipe[0]);
+        alarm(5); // EventLoop 没有停止接口，失败时由 alarm 结束子进程。
+
+        EventLoop loop;
+        // port=0 表示让内核分配一个可用端口，避免测试固定占用某个端口。
+        Acceptor acceptor(&loop, "127.0.0.1", 0);
+
+        // 读取内核实际分配的端口，并通知父进程去连接它。
+        sockaddr_in addr{};
+        socklen_t addr_len = sizeof(addr);
+        if (getsockname(acceptor.GetListenSocketFd(), reinterpret_cast<sockaddr *>(&addr), &addr_len) != 0)
+            _exit(2);
+        const uint16_t port = ntohs(addr.sin_port);
+        if (port == 0 || write(port_pipe[1], &port, sizeof(port)) != sizeof(port))
+            _exit(3);
+        close(port_pipe[1]);
+
+        // 客户端 connect 后，监听 fd 可读，Channel 会调用 Acceptor::HandleRead。
+        acceptor.SetAcceptCallbak([&result_pipe](int client_fd)
+                                  {
+            const char result = client_fd >= 0 ? '1' : '0';
+            if (client_fd >= 0)
+                close(client_fd); // 此测试只验证 accept；client_fd 不再交给 Connection。
+            write(result_pipe[1], &result, sizeof(result));
+            _exit(result == '1' ? 0 : 4); });
+
+        loop.StartEventLoop();
+        _exit(5);
+    }
+
+    close(port_pipe[1]);
+    close(result_pipe[1]);
+
+    uint16_t port = 0;
+    if (read(port_pipe[0], &port, sizeof(port)) != sizeof(port) || port == 0)
+        throw std::runtime_error("Acceptor did not provide a listening port");
+    close(port_pipe[0]);
+
+    // 父进程模拟客户端；connect 成功后会使子进程的监听 socket 变为可读。
+    Socket client;
+    if (!client.CreateClient("127.0.0.1", port))
+        throw std::runtime_error("Acceptor test client connect failed");
+
+    char result = '0';
+    const bool accepted = read(result_pipe[0], &result, sizeof(result)) == sizeof(result) && result == '1';
+    close(result_pipe[0]);
+
+    int status = 0;
+    const bool child_ok = waitpid(child, &status, 0) == child &&
+                          WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!accepted || !child_ok)
+        throw std::runtime_error("Acceptor test failed");
+
+    std::cout << "[PASS] Acceptor: listen -> accept -> callback\n";
+}
+
 int main()
 {
     // testtimerfd();
@@ -755,6 +917,8 @@ int main()
     // testserver();
     // testsocket();
     // testchannel_poller();
-    testeventloop_timewheel();
+    // testeventloop_timewheel();
+    testconnection();
+    testacceptor();
     return 0;
 }

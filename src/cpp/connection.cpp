@@ -15,40 +15,33 @@ Connection::Connection(EventLoop *loop, int fd, uint64_t conn_id)
     _socket.SetNonBlocking(true); // 防止某条连接的收发阻塞整个事件循环
 }
 
-void Connection::Established()
+void Connection::EstablishedInLoop()
 {
+    assert(_loop->IsInLoopThread());
     if (_statu != CONNECTING)
         return;
 
-    // Channel 可能被 Poller 持有。弱引用既避免循环引用，也避免调用已销毁的连接。
-    std::weak_ptr<Connection> weak = shared_from_this();
-    _channel->SetReadCallbck([weak]()
-                             {
-        auto conn = weak.lock();
-        if (conn) conn->HandleRead(); });
-    _channel->SetWriteCallbck([weak]()
-                              {
-        auto conn = weak.lock();
-        if (conn) conn->HandleWrite(); });
-    _channel->SetCloseCallbck([weak]()
-                              {
-        auto conn = weak.lock();
-        if (conn) conn->HandleClose(); });
-    _channel->SetErrorCallbck([weak]()
-                              {
-        auto conn = weak.lock();
-        if (conn) conn->HandleClose(); });
-    _channel->SetEventCallbck([weak]()
-                              {
-        auto conn = weak.lock();
-        if (conn) conn->HandleAny(); });
-
     _statu = CONNECTED;
     _channel->EnableRead();
-    _channel->Update(); // 本项目 EnableRead 只改事件标记，还需要显式 Update
-    auto cb = _connected_callback;
-    if (cb)
-        cb(shared_from_this());
+    std::weak_ptr<Connection> weak = shared_from_this();
+    _channel->SetReadCallbck([weak]
+                             {
+        if (auto conn = weak.lock()) conn->HandleRead(); });
+    _channel->SetWriteCallbck([weak]
+                              {
+        if (auto conn = weak.lock()) conn->HandleWrite(); });
+    _channel->SetCloseCallbck([weak]
+                              {
+        if (auto conn = weak.lock()) conn->HandleClose(); });
+    _channel->SetErrorCallbck([weak]
+                              {
+        if (auto conn = weak.lock()) conn->HandleClose(); });
+    _channel->SetEventCallbck([weak]
+                              {
+        if (auto conn = weak.lock()) conn->HandleAny(); });
+    _channel->Update(); // 监听可读事件后添加到epoll中
+    if (_connected_callback)
+        _connected_callback(shared_from_this());
 }
 
 void Connection::HandleRead()
@@ -60,30 +53,33 @@ void Connection::HandleRead()
         return;
     }
     char data[65536];
-    ssize_t ret = _socket.Recv(data, 65536);
+    ssize_t ret = _socket.Recv(data, sizeof(data));
+    if (ret == 0)
+    {
+        Shutdown(); // 对端正常关闭
+        return;
+    }
     if (ret < 0)
     {
-        // 读取发生错误时不能立即 close，先让 Shutdown 处理待发送的数据。
-        Shutdown();
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return; // 暂时无法读取
+        Shutdown(); // 真正的读取错误
         return;
     }
 
-    if (ret > 0)
-        _In_buffer.WriteAndPush(data, ret); // 写入缓冲区，并移动写指针
-
+    _In_buffer.WriteAndPush(data, ret);
     if (_In_buffer.ReadAbleSize() > 0 && _message_callback)
-        _message_callback(shared_from_this(), _In_buffer); // 通知上层协议处理数据
+        _message_callback(shared_from_this(), _In_buffer);
 }
 
-void Connection::Send(const std::string &msg)
+void Connection::SendInLoop(const std::string &msg) // 只负责写入输出缓冲区，发送数据由handlewrite负责
 {
-    if (_statu != CONNECTED || msg.empty())
+    assert(_loop->IsInLoopThread());
+    if (_statu == DISCONNECTED || _statu == CONNECTING || msg.empty())
         return;
 
-    // send() 可能只发送一部分数据，所以先写入输出缓冲区。
-    // 剩余数据由 HandleWrite() 在下一次 EPOLLOUT 时继续发送。
     _Out_buffer.WriteStringAndPush(msg);
-    _channel->EnableWrite();
+    _channel->EnableWrite(); // 开启写事件监控
     _channel->Update();
 }
 
@@ -101,7 +97,7 @@ void Connection::HandleWrite()
         ssize_t ret = _socket.Send(_Out_buffer.GetReaderPtr(), _Out_buffer.ReadAbleSize());
         if (ret < 0)
         {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 return; // 内核发送缓冲区满了，保留数据等待下一次可写事件
             ERR_LOG("连接发送失败，fd=%d, errno=%d", _socket.GetSocketFd(), errno);
             if (_In_buffer.ReadAbleSize() > 0 && _message_callback)
@@ -122,18 +118,22 @@ void Connection::HandleWrite()
     }
 }
 
-void Connection::Shutdown()
+void Connection::ShutdownInLoop()
 {
+    assert(_loop->IsInLoopThread());
     if (_statu == DISCONNECTED || _statu == DISCONNECTING)
         return;
 
     _statu = DISCONNECTING;
     _channel->DisableRead();
+    _channel->Update();
+    if (_In_buffer.ReadAbleSize() > 0 && _message_callback) // 输入缓冲区还有数据
+        _message_callback(shared_from_this(), _In_buffer);
     if (_Out_buffer.ReadAbleSize() == 0)
         Release();
-    else
+    else // 输出缓冲区还有数据
     {
-        _channel->EnableWrite(); // 先发完缓冲区，不能直接 close 丢掉回复
+        _channel->EnableWrite(); // 继续尝试向fd发送数据
         _channel->Update();
     }
 }
@@ -144,38 +144,37 @@ void Connection::HandleClose()
     if (_statu == DISCONNECTED)
         return;
 
+    if (_In_buffer.ReadAbleSize() > 0 && _message_callback)
+        _message_callback(shared_from_this(), _In_buffer); // 通知上层协议处理数据
+
     Release();
 }
 
-void Connection::Release()
+void Connection::Release() // 真正释放连接
 {
+    assert(_loop->IsInLoopThread());
     if (_statu == DISCONNECTED)
         return; // 同一轮可能同时有读、错误、挂断事件，只关闭一次
 
-    auto self = shared_from_this(); // 关闭回调可能删除服务器保存的最后一个引用
     _statu = DISCONNECTED;
-    if (_enable_inactive_close)
-    {
-        _loop->CancelTask(_conn_id);
-        _enable_inactive_close = false;
-    }
+    _loop->CancelTask(_conn_id); // 及时取消任务，防止使用空指针
     _channel->DisableAll();
     _channel->Remove(); // 先移除 epoll 监控，再关闭 fd
     _socket.Close();
-    auto cb = _close_callback;
-    if (cb)
-        cb(self);
+    if (_close_callback)
+        _close_callback(shared_from_this());
 }
 
 void Connection::HandleAny()
 {
     if (_statu == DISCONNECTED)
         return;
+
     if (_enable_inactive_close)
-        _loop->RefreshTask(_conn_id);
-    auto cb = _any_callback;
-    if (cb)
-        cb(shared_from_this());
+        _loop->RefreshTask(_conn_id); // 在timerwheel中刷新事件
+
+    if (_any_callback)
+        _any_callback(shared_from_this());
 }
 
 void Connection::SetConnectedCallback(const ConnectedCallback &cb)
@@ -200,29 +199,54 @@ void Connection::SetAnyCallback(const AnyCallback &cb)
 
 void Connection::SetInactiveClose(bool enable, uint64_t sec)
 {
-    // 当前时间轮只有 60 个槽，超过范围会取模，导致提前超时。
     if (enable && (sec == 0 || sec >= 60))
-        throw std::invalid_argument("inactive timeout must be between 1 and 59 seconds");
+    {
+        ERR_LOG("inactive timeout must be between 1 and 59 seconds");
+        return;
+    }
+
+    auto self = shared_from_this();
+    _loop->RunInLoop([self, enable, sec]
+                     { self->SetInactiveCloseInLoop(enable, sec); });
+}
+
+void Connection::SetInactiveCloseInLoop(bool enable, uint64_t sec)
+{
+    assert(_loop->IsInLoopThread());
     if (_statu == DISCONNECTED)
         return;
+
     if (_enable_inactive_close)
         _loop->CancelTask(_conn_id);
+
     _enable_inactive_close = enable;
     if (!enable)
         return;
 
     std::weak_ptr<Connection> weak = shared_from_this();
-    _loop->AddTask(_conn_id, sec, [weak]()
+    _loop->AddTask(_conn_id, sec, [weak]
                    {
-        auto conn = weak.lock();
-        // TimerTask 到期时执行此回调；连接还存在才关闭。
-        if (conn) conn->HandleClose(); });
+        if (auto conn = weak.lock())
+            conn->HandleClose(); });
 }
 
-void Connection::SwitchProtocol(const Any &context, const ConnectedCallback &conn,
-                                const MessageCallback &msg, const CloseCallback &closed,
-                                const AnyCallback &event)
+void Connection::SwitchProtocol(
+    const Any &context,
+    const ConnectedCallback &conn,
+    const MessageCallback &msg,
+    const CloseCallback &closed,
+    const AnyCallback &event)
 {
+    auto self = shared_from_this();
+    _loop->RunInLoop([self, context, conn, msg, closed, event]
+                     { self->SwitchProtocolInloop(context, conn, msg, closed, event); });
+}
+
+void Connection::SwitchProtocolInloop(const Any &context, const ConnectedCallback &conn,
+                                      const MessageCallback &msg, const CloseCallback &closed,
+                                      const AnyCallback &event)
+{
+    assert(_loop->IsInLoopThread());
     if (_statu == DISCONNECTED)
         return;
 
@@ -234,18 +258,41 @@ void Connection::SwitchProtocol(const Any &context, const ConnectedCallback &con
     _any_callback = event;
 }
 
+// 三个函数可能在其他业务线程调用，不一定在loop中执行
+void Connection::Established()
+{
+    auto self = shared_from_this();
+    _loop->RunInLoop([self]
+                     { self->EstablishedInLoop(); });
+}
+
+void Connection::Send(const std::string &msg)
+{
+    if (msg.empty())
+        return;
+
+    auto self = shared_from_this();
+    _loop->RunInLoop([self, msg]
+                     { self->SendInLoop(msg); });
+}
+
+void Connection::Shutdown()
+{
+    auto self = shared_from_this();
+    _loop->RunInLoop([self]
+                     { self->ShutdownInLoop(); });
+}
+
 Connection::~Connection()
 {
     // 正常关闭已在 Release() 中清理；这里处理外部直接释放连接的情况。
-    // 最后一个 shared_ptr 应在 Loop 线程中释放，且 Loop 仍然存活。
     if (_statu != DISCONNECTED)
     {
-        if (_enable_inactive_close)
-            _loop->CancelTask(_conn_id);
+        _loop->CancelTask(_conn_id);
         _channel->DisableAll();
         _channel->Remove();
     }
-    // Socket 的析构函数负责关闭 fd。
+    // Socket 的析构函数关闭 fd
 }
 
 int Connection::GetSocketfd() const { return _socket.GetSocketFd(); }

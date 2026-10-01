@@ -92,7 +92,7 @@ TimerTask::~TimerTask()
 
 void TimeWheel::RemoveTimer(uint64_t id)
 {
-    if (_task_map.find(id) != _task_map.end())
+    if (_task_map.find(id) != _task_map.end() && _task_map[id].expired()) // 已经没有 shared_ptr 持有这个 Connection
     {
         _task_map.erase(id);
     }

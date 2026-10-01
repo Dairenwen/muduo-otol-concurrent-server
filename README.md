@@ -977,3 +977,13 @@ flowchart TD
     S --> T[关闭 socket]
     T --> U[调用 CloseCallback]
 ```
+
+### 2.7 Acceptor模块
+- 功能：对监听套接字进行管理
+- 涉及：
+  1. 创建监听套接字；
+  2. 启动读事件监控；
+  3. 事件触发之后获取新链接；
+  4. 为新链接创建Connection进行管理，调用新链接回调函数；
+
+总结：`Acceptor` 监听监听 socket，有新连接时通过 `accept()` 得到已连接的 `client_fd`，用它构造 `Connection`，再由 `Connection` 的 `Channel` 注册到 `Poller` 管理后续读写与关闭事件。

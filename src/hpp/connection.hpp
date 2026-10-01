@@ -27,7 +27,7 @@ public:
     using AnyCallback = std::function<void(const ConnPtr &)>;
 
 private:
-    uint64_t _conn_id;                 // 同一个 Loop 内的连接 ID 必须唯一
+    uint64_t _conn_id;                 // 连接ID同时也是任务ID
     Socket _socket;                    // 负责关闭 fd
     std::shared_ptr<Channel> _channel; // channel由shareptr管理
     Buffer _In_buffer;                 // 输入缓冲区
@@ -44,6 +44,13 @@ private:
 
     void Release(); // 实际的释放接口
     void HandleAny();
+    void EstablishedInLoop();
+    void SendInLoop(const std::string &msg);
+    void ShutdownInLoop();
+    void SetInactiveCloseInLoop(bool enable, uint64_t sec);
+    void SwitchProtocolInloop(const Any &context, const ConnectedCallback &conn,
+                            const MessageCallback &msg, const CloseCallback &closed,
+                            const AnyCallback &event);
 
 public:
     Connection(EventLoop *loop, int fd, uint64_t conn_id);
@@ -68,8 +75,8 @@ public:
     void SetInactiveClose(bool enable, uint64_t sec);
     // 常用于http升级到websocket
     void SwitchProtocol(const Any &context, const ConnectedCallback &conn,
-                        const MessageCallback &msg, const CloseCallback &closed,
-                        const AnyCallback &event);
+                              const MessageCallback &msg, const CloseCallback &closed,
+                              const AnyCallback &event);
 
     int GetSocketfd() const;
     uint64_t GetConnId() const;

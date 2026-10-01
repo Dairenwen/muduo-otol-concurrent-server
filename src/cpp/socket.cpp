@@ -112,24 +112,7 @@ ssize_t Socket::Recv(void *buf, size_t len, int flags)
     }
 
     // recv(): 从 socket 读数据，返回读取到的字节数
-    ssize_t ret = recv(_socket_fd, buf, len, flags);
-    if (ret < 0)
-    {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-        {
-            // 非阻塞模式下，没有数据可读,或者被信号中断，返回 0 表示没有读取到数据
-            return 0;
-        }
-        else
-        {
-            ERR_LOG("接收数据失败，errno = %d", errno);
-            return -1;
-        }
-    }
-    else
-    {
-        return ret;
-    }
+    return recv(_socket_fd, buf, len, flags);
 }
 
 ssize_t Socket::Send(const void *buf, size_t len, int flags)
