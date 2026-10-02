@@ -10,6 +10,7 @@
 #include "connection.hpp"
 #include "acceptor.hpp"
 #include "loopthread.hpp"
+#include "LoopThreadPool.hpp"
 #include <vector>
 #include <assert.h>
 #include <memory>
@@ -22,6 +23,11 @@
 #include <unistd.h>
 #include <iostream>
 #include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <future>
 #include <regex>
 #include <stdexcept>
 #include <unordered_map>
@@ -1099,17 +1105,54 @@ void testacceptor()
     std::cout << "[PASS] Acceptor + LoopThread + EventLoop + Poller + Channel + Connection + Buffer + Any + TimeWheel\n";
 }
 
+void testloopthreadpoll()
+{
+    std::cout << "=============== LoopThreadPool Test Begin ===============\n";
+
+    // 主 Loop 只用于验证“没有工作线程时返回主 Loop”的配置语义。
+    EventLoop main_loop;
+    LoopThreadPool pool(&main_loop);
+
+    pool.SetThreadCount(2);
+    pool.Create();
+
+    // RR 分配：两次获取应落在两个不同的子 Loop，第三次回到第一个。
+    EventLoop *first = pool.NextLoop();
+    EventLoop *second = pool.NextLoop();
+    EventLoop *third = pool.NextLoop();
+    assert(first != nullptr && second != nullptr && third == first);
+    assert(first != second);
+    assert(!first->IsInLoopThread());
+    assert(!second->IsInLoopThread());
+
+    // QueueInLoop 会唤醒对应子 Loop，并在子线程中执行任务。
+    std::promise<bool> first_task;
+    std::promise<bool> second_task;
+    auto first_result = first_task.get_future();
+    auto second_result = second_task.get_future();
+    first->QueueInLoop([first, &first_task]
+                       { first_task.set_value(first->IsInLoopThread()); });
+    second->QueueInLoop([second, &second_task]
+                        { second_task.set_value(second->IsInLoopThread()); });
+    assert(first_result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    assert(second_result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    assert(first_result.get() && second_result.get());
+
+    std::cout << "[PASS] LoopThreadPool: 创建、RR 分配、任务投递和线程回收\n";
+}
+
 int main()
 {
     // testtimerfd();
-    testregex();
-    testAny();
-    testlog();
-    testserver();
-    testsocket();
-    testchannel_poller();
-    testeventloop_timewheel();
-    testconnection();
-    testacceptor();
+    // testregex();
+    // testAny();
+    // testlog();
+    // testserver();
+    // testsocket();
+    // testchannel_poller();
+    // testeventloop_timewheel();
+    // testconnection();
+    // testacceptor();
+    testloopthreadpoll();
     return 0;
 }

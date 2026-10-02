@@ -1169,3 +1169,16 @@ flowchart TD
 ```
 
 调用方获取 Loop 后，通过 `RunInLoop()` 或 `QueueInLoop()` 将连接初始化操作交给它执行。**线程池负责选择 Loop，连接的创建和回调设置由上层负责。**
+
+
+## 3.模块整合
+
+### 3.1 TcpServer模块
+
+- 功能：对所有模块的整合，通过TcpServer模块实例化的对象，包含有：
+
+1. Acceptor对象，创建一个监听套接字
+2. EventLoop对象，mainloop对象；
+3. std::unordered_map<uint64_t, PtrConnection> _conns, 实现对所有新建连接的管理
+4. LoopThreadPool对象，创建loop线程池，对新建连接进行事件监控及处理
+

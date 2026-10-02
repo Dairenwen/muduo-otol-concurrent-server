@@ -8,8 +8,6 @@ LoopThreadPool::LoopThreadPool(EventLoop *mainloop)
 
 LoopThreadPool::~LoopThreadPool()
 {
-    // 由服务器主线程销毁线程池；应先关闭连接，再回收它们所属的工作 Loop。
-    // _loops 只保存借用的指针，不能 delete；真正的 Loop 由 LoopThread 管理。
     INF_LOG("LoopThreadPool 开始回收 %zu 个工作线程", _threads.size());
     _loops.clear();
     for (LoopThread *thread : _threads)
@@ -27,12 +25,12 @@ void LoopThreadPool::SetThreadCount(int count)
     if (count < 0)
     {
         ERR_LOG("LoopThreadPool 线程数量不能为负数，count=%d", count);
-        throw std::invalid_argument("LoopThreadPool thread count must be nonnegative");
+        return;
     }
     if (!_threads.empty())
     {
         ERR_LOG("LoopThreadPool 已创建工作线程，不能再修改线程数量");
-        throw std::logic_error("SetThreadCount must be called before Create");
+        return;
     }
 
     _thread_count = count;
