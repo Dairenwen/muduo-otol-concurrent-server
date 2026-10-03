@@ -26,6 +26,23 @@ void TcpServer::StartServer()
     _mainloop.StartEventLoop();
 }
 
+void TcpServer::StopServer()
+{
+    _mainloop.StopEventLoop();
+}
+
+uint16_t TcpServer::GetListenPort() const
+{
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (getsockname(_acceptor.GetListenSocketFd(), reinterpret_cast<sockaddr *>(&addr), &len) != 0)
+    {
+        ERR_LOG("TcpServer 获取客户端端口号错误");
+        return -1;
+    }
+    return ntohs(addr.sin_port);
+}
+
 void TcpServer::SetThreadCount(int count)
 {
     _pool.SetThreadCount(count);

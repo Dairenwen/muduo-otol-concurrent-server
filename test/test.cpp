@@ -1141,6 +1141,219 @@ void testloopthreadpoll()
     std::cout << "[PASS] LoopThreadPool: 创建、RR 分配、任务投递和线程回收\n";
 }
 
+void testtcpserver()
+{
+    // 父进程运行 EchoServer；子进程作为 TCP 客户端。ready 管道传递监听端口，done 管道传递测试结果，业务数据走 TCP。
+    auto require = [](bool ok, const char *message)
+    {
+        if (!ok)
+            throw std::runtime_error(message);
+    };
+    int ready[2], done[2];
+    require(pipe(ready) == 0, "ready pipe failed");
+    if (pipe(done) != 0)
+    {
+        close(ready[0]);
+        close(ready[1]);
+        throw std::runtime_error("done pipe failed");
+    }
+    std::cout.flush();          // fork 前刷新，避免父子进程重复输出已有内容。
+    const pid_t child = fork(); // 必须在 EchoServer 创建工作线程之前 fork。
+    if (child < 0)
+    {
+        close(ready[0]);
+        close(ready[1]);
+        close(done[0]);
+        close(done[1]);
+        throw std::runtime_error("fork failed");
+    }
+    if (child == 0)
+    {
+        // 子进程只读端口、写结果；关闭不用的管道端，保证 EOF 能正常传递。
+        close(ready[1]);
+        close(done[0]);
+        alarm(35); // 包括等待就绪和客户端收发，整个子进程有硬超时。
+        unsigned char result = 1;
+        try
+        {
+            uint16_t port = 0;
+            ssize_t n;
+            // 等父进程创建监听 socket 后，再连接其实际端口。
+            do
+            {
+                n = read(ready[0], &port, sizeof(port));
+            } while (n < 0 && errno == EINTR);
+            require(n == sizeof(port) && port != 0, "server did not publish port");
+            close(ready[0]);
+            auto connect_client = [&](Socket &client, int seconds = 5)
+            {
+                require(client.CreateClient("127.0.0.1", port), "connect failed");
+                timeval timeout{};
+                // 收发限时，服务端异常时客户端不会一直阻塞。
+                timeout.tv_sec = seconds;
+                require(setsockopt(client.GetSocketFd(), SOL_SOCKET, SO_RCVTIMEO,
+                                   &timeout, sizeof(timeout)) == 0,
+                        "recv timeout failed");
+                require(setsockopt(client.GetSocketFd(), SOL_SOCKET, SO_SNDTIMEO,
+                                   &timeout, sizeof(timeout)) == 0,
+                        "send timeout failed");
+            };
+            auto echo = [&](Socket &client, const std::string &expected)
+            {
+                // TCP 可能部分收发：发送和接收都累计到预期长度。
+                size_t sent = 0;
+                while (sent < expected.size())
+                {
+                    const ssize_t count = client.Send(expected.data() + sent,
+                                                      expected.size() - sent, MSG_NOSIGNAL);
+                    // EINTR 重试；MSG_NOSIGNAL 避免断连时 SIGPIPE 终止客户端。
+                    if (count < 0 && errno == EINTR)
+                        continue;
+                    require(count > 0, "send failed/timed out");
+                    sent += static_cast<size_t>(count);
+                }
+                std::string actual(expected.size(), '\0');
+                size_t received = 0;
+                while (received < actual.size())
+                {
+                    const ssize_t count = client.Recv(&actual[received], actual.size() - received);
+                    if (count < 0 && errno == EINTR)
+                        continue;
+                    require(count > 0, "early EOF or recv failed/timed out");
+                    received += static_cast<size_t>(count);
+                }
+                require(actual == expected, "echo bytes mismatch"); // 按完整字节串比较，包含零字节。
+            };
+            auto expect_eof = [&](Socket &client)
+            {
+                char byte;
+                ssize_t count;
+                do
+                {
+                    count = client.Recv(&byte, 1);
+                } while (count < 0 && errno == EINTR);
+                require(count == 0, "expected EOF, got extra data/error/timeout"); // 只有 0 表示正常关闭。
+            };
+            auto finish = [&](Socket &client)
+            {
+                // 关闭发送方向，保留接收方向以观察服务端关闭。
+                require(shutdown(client.GetSocketFd(), SHUT_WR) == 0, "half-close failed");
+                expect_eof(client); // 确认服务端已经处理 EOF 后才结束测试。
+            };
+            {
+                Socket client;
+                connect_client(client);
+                echo(client, "hel");
+                echo(client, "lo\n"); // 在同一条连接上分段收发，不假设 recv 的分包边界。
+                echo(client, std::string("a\0b\xff\n", 5)); // 验证二进制处理，不依赖字符串结束符。
+                std::string large(256 * 1024, '\0');
+                for (size_t i = 0; i < large.size(); ++i)
+                    large[i] = static_cast<char>(i % 251);
+                echo(client, large); // 超过单次 64 KiB 读取，并逐字节比对。
+                finish(client);
+                std::cout << "[PASS] 多次收发、分段数据、二进制、256 KiB 回显和半关闭\n";
+            }
+            {
+                // 每个并发客户端发送不同内容，检测连接间串线。
+                std::vector<std::future<void>> clients;
+                for (int i = 0; i < 8; ++i)
+                    clients.push_back(std::async(std::launch::async, [&, i]
+                                                 {
+                        Socket client;
+                        connect_client(client);
+                        echo(client, std::string(32 * 1024, static_cast<char>('A' + i)));
+                        finish(client); }));
+                for (auto &client : clients)
+                    client.get(); // 等待全部完成，并将客户端线程异常传回测试线程。
+                std::cout << "[PASS] 8 个并发客户端，无串线或数据丢失\n";
+            }
+            {
+                Socket client;
+                connect_client(client, 15);
+                // 先回显确认连接已建立，然后静默等待 10 秒非活跃释放。
+                echo(client, "idle-check");
+                const auto begin = std::chrono::steady_clock::now();
+                expect_eof(client);
+                const auto elapsed = std::chrono::steady_clock::now() - begin;
+                // 留出时间轮刻度和调度误差，同时排除立即关闭或超时失效。
+                require(elapsed >= std::chrono::seconds(8) && elapsed < std::chrono::seconds(14),
+                        "idle close happened outside expected interval");
+                std::cout << "[PASS] 10 秒空闲超时关闭\n";
+            }
+            result = 0;
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr << "[FAIL] EchoServer client: " << error.what() << '\n';
+        }
+        // 一个字节小于 PIPE_BUF；处理信号中断，父进程还能用 waitpid 交叉验证。
+        ssize_t count;
+        do
+        {
+            count = write(done[1], &result, sizeof(result));
+        } while (count < 0 && errno == EINTR);
+        close(done[1]);
+        std::cout.flush();
+        std::cerr.flush();
+        _exit(result == 0 && count == sizeof(result) ? 0 : 1); // 子进程直接退出，不继续执行父进程逻辑。
+    }
+
+    close(ready[0]);
+    close(done[1]);
+    int client_result = -1;
+    std::exception_ptr server_error;
+    try
+    {
+        EchoServer server(0); // 让系统分配空闲端口，避免固定端口冲突
+        const uint16_t port = server.GetListenPort();
+        ssize_t count;
+        do
+        {
+            count = write(ready[1], &port, sizeof(port));
+        } while (count < 0 && errno == EINTR);
+        require(count == sizeof(port), "port handoff failed");
+        close(ready[1]);
+        ready[1] = -1;
+        // 辅助线程只等管道结果并投递停止请求；EventLoop 始终在父进程主线程运行。
+        std::thread completion([&]
+                               {
+                                    unsigned char result = 1;
+                                    ssize_t n;
+                                    do
+                                    {
+                                        n = read(done[0], &result, sizeof(result));
+
+                                    } while (n < 0 && errno == EINTR);
+
+                                    client_result = n == sizeof(result) ? result : 1;
+                                    // 管道 EOF 或读取失败也算失败，仍请求主循环退出。
+                                    server.StopServer(); });
+
+        server.StartServer();
+        completion.join(); // 等辅助线程退出后再析构 server，也同步 client_result 的写入。
+    }
+    catch (...)
+    {
+        server_error = std::current_exception();
+        kill(child, SIGKILL);
+    }
+    if (ready[1] >= 0)
+        close(ready[1]);
+    close(done[0]);
+    int status = 0;
+    pid_t waited;
+    // 回收子进程，检查是否被信号终止或返回失败，避免只相信管道结果。
+    do
+    {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (server_error)
+        std::rethrow_exception(server_error);
+    require(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 && client_result == 0,
+            "EchoServer child checks failed or timed out");
+    std::cout << "[PASS] 父进程 EchoServer / 子进程 TCP 客户端 / 管道同步 / 线程退出\n";
+}
+
 int main()
 {
     // testtimerfd();
@@ -1153,6 +1366,7 @@ int main()
     // testeventloop_timewheel();
     // testconnection();
     // testacceptor();
-    testloopthreadpoll();
+    // testloopthreadpoll();
+    testtcpserver();
     return 0;
 }

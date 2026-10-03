@@ -38,6 +38,7 @@ private:
 public:
     TcpServer(int port);
     void StartServer();
+    void StopServer();
     void SetThreadCount(int count);
     void EnableInactiveRelease(int timeout);
     void SetConnectedCallback(const ConnectedCallback &cb);
@@ -45,4 +46,55 @@ public:
     void SetCloseCallback(const CloseCallback &cb);
     void SetAnyCallback(const AnyCallback &cb);
     void RunAfter(const TaskFunc &task, int sec);
+    uint16_t GetListenPort() const;
+};
+
+class EchoServer
+{
+private:
+    TcpServer _server;
+
+    void Onconnected(const ConnPtr &cn)
+    {
+        DBG_LOG("new connection!:%p", cn.get());
+    }
+
+    void Onclosed(const ConnPtr &cn)
+    {
+        DBG_LOG("close connection!:%p", cn.get());
+    }
+
+    void Onmessaged(const ConnPtr &cn, Buffer &bf)
+    {
+        const auto size = bf.ReadAbleSize();
+        DBG_LOG("echo bytes=%llu", static_cast<unsigned long long>(size));
+        // 按实际长度回显，支持二进制以及分段到达的数据。
+        cn->Send(bf.ReadAsStringAndPop(size));
+    };
+
+public:
+    EchoServer(int port)
+        : _server(port)
+    {
+        _server.SetThreadCount(2);
+        _server.EnableInactiveRelease(10);
+        _server.SetConnectedCallback(std::bind(&EchoServer::Onconnected, this, std::placeholders::_1));
+        _server.SetCloseCallback(std::bind(&EchoServer::Onclosed, this, std::placeholders::_1));
+        _server.SetMessageCallback(std::bind(&EchoServer::Onmessaged, this, std::placeholders::_1, std::placeholders::_2));
+    }
+
+    void StartServer()
+    {
+        _server.StartServer();
+    }
+
+    uint16_t GetListenPort() const
+    {
+        return _server.GetListenPort();
+    }
+
+    void StopServer()
+    {
+        _server.StopServer();
+    }
 };

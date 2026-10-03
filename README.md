@@ -1182,3 +1182,33 @@ flowchart TD
 3. std::unordered_map<uint64_t, PtrConnection> _conns, 实现对所有新建连接的管理
 4. LoopThreadPool对象，创建loop线程池，对新建连接进行事件监控及处理
 
+#### EchoServer实现
+
+使用EchoServer封装TcpServer来实现回显服务器，并使用WebBench来进行测试：
+
+Webbench 是用 C 编写的小型 HTTP 压测工具，通过 fork 多个进程模拟客户端，各进程在指定时间内反复建立连接、发送请求、读取响应、关闭连接，最后通过管道汇总结果。支持 HTTP/0.9、1.0、1.1、代理和 GET/HEAD/OPTIONS/TRACE；不支持 HTTPS，也不是 HTTP/2 或长连接性能测试工具。
+
+Ubuntu 24.04 的系统头文件布局与旧版源码不同，需要 libtirpc-dev 和 include 路径。本次在已有 ubuntu2404 容器中安装了该包，推荐只编译 webbench 目标，避免 all 目标额外调用 ctags：
+
+```sh
+sudo apt-get install libtirpc-dev
+cd test/webbench
+make webbench CFLAGS='-Wall -O2 -I/usr/include/tirpc'
+./webbench --help
+./webbench --version
+```
+
+对 HTTP 服务器运行，例如：
+
+```sh
+./webbench -c 10 -t 30 http://127.0.0.1:8080/
+```
+
+- `-c 10`：10 个客户端进程，不代表 10 个持续保持的长连接。
+- `-t 30`：运行 30 秒。
+- `-2`：使用 HTTP/1.1 请求格式，不启用 keep-alive。
+- `-f`：发请求后不等待回复，不能用来验证完整响应吞吐或正确性。
+
+输出中的 pages/min 是每分钟请求尝试数量的换算：此版本源码使用 `(成功数 + 失败数) / (秒数 / 60)`。所以失败多时也可能有很高的 Speed，必须同时看失败数。bytes/sec 是读到的字节数除以测试时间，包含 HTTP 响应头。它没有校验 HTTP 状态码及业务内容，不能把 succeed 理解成 HTTP 200 或业务正确。
+
+参考：[镜像 README](https://github.com/tamlok/webbench)、[源码](https://github.com/tamlok/webbench/blob/master/webbench.c)、[FreeBSD Webbench 说明](https://www.freshports.org/benchmarks/webbench/)。
