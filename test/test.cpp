@@ -1244,7 +1244,7 @@ void testtcpserver()
                 Socket client;
                 connect_client(client);
                 echo(client, "hel");
-                echo(client, "lo\n"); // 在同一条连接上分段收发，不假设 recv 的分包边界。
+                echo(client, "lo\n");                       // 在同一条连接上分段收发，不假设 recv 的分包边界。
                 echo(client, std::string("a\0b\xff\n", 5)); // 验证二进制处理，不依赖字符串结束符。
                 std::string large(256 * 1024, '\0');
                 for (size_t i = 0; i < large.size(); ++i)
@@ -1329,8 +1329,16 @@ void testtcpserver()
                                     // 管道 EOF 或读取失败也算失败，仍请求主循环退出。
                                     server.StopServer(); });
 
-        server.StartServer();
-        completion.join(); // 等辅助线程退出后再析构 server，也同步 client_result 的写入。
+        try
+        {
+            server.StartServer();
+        }
+        catch (...)
+        {
+            server_error = std::current_exception();
+            kill(child, SIGKILL); // 子进程退出，关闭 done 管道写端，辅助线程读到 EOF。
+        }
+        completion.join();
     }
     catch (...)
     {
@@ -1354,6 +1362,13 @@ void testtcpserver()
     std::cout << "[PASS] 父进程 EchoServer / 子进程 TCP 客户端 / 管道同步 / 线程退出\n";
 }
 
+void testwebbench()
+{
+    // 在wenbench下运行./webbench -c 10 -t 30 http://127.0.0.1:8080/，用8080端口进行测试
+    EchoServer server(8080);
+    server.StartServer();
+}
+
 int main()
 {
     // testtimerfd();
@@ -1367,6 +1382,7 @@ int main()
     // testconnection();
     // testacceptor();
     // testloopthreadpoll();
-    testtcpserver();
+    // testtcpserver();
+    testwebbench();
     return 0;
 }

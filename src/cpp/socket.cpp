@@ -124,7 +124,7 @@ ssize_t Socket::Send(const void *buf, size_t len, int flags)
     }
 
     // send(): 向 socket 写数据，返回发送的字节数
-    ssize_t ret = send(_socket_fd, buf, len, flags);
+    ssize_t ret = send(_socket_fd, buf, len, flags | MSG_NOSIGNAL); // 客户端关闭不受到SIGPIPE影响，正常返回-1
     if (ret < 0)
     {
         ERR_LOG("发送数据失败，errno = %d", errno);
@@ -234,8 +234,8 @@ void Socket::SetNonBlocking(bool non_blocking)
     // F_GETFL: 获取文件状态标志，0: 默认参数
     if (flags < 0)
     {
-        ERR_LOG("获取文件状态标志失败，fd = %d", _socket_fd);
-        return;
+        ERR_LOG("获取套接字状态标志失败，fd = %d", _socket_fd);
+        throw std::runtime_error("fcntl F_GETFL failed");
     }
     if (non_blocking)
     {
@@ -246,7 +246,11 @@ void Socket::SetNonBlocking(bool non_blocking)
         flags &= ~O_NONBLOCK; // 清除非阻塞模式
     }
 
-    fcntl(_socket_fd, F_SETFL, flags);
+    if (fcntl(_socket_fd, F_SETFL, flags) == -1)
+    {
+        ERR_LOG("设置套接字状态标志失败，fd = %d", _socket_fd);
+        throw std::runtime_error("fcntl F_SETFL failed");
+    }
     INF_LOG("设置非阻塞模式成功，fd = %d, non_blocking = %d", _socket_fd, non_blocking);
 }
 

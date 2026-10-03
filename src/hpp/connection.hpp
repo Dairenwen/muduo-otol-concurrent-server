@@ -40,6 +40,7 @@ private:
     ConnectedCallback _connected_callback;
     MessageCallback _message_callback;
     CloseCallback _close_callback;
+    CloseCallback _server_close_callback;
     AnyCallback _any_callback;
 
     void Release(); // 实际的释放接口
@@ -49,8 +50,8 @@ private:
     void ShutdownInLoop();
     void SetInactiveCloseInLoop(bool enable, uint64_t sec);
     void SwitchProtocolInloop(const Any &context, const ConnectedCallback &conn,
-                            const MessageCallback &msg, const CloseCallback &closed,
-                            const AnyCallback &event);
+                              const MessageCallback &msg, const CloseCallback &closed,
+                              const AnyCallback &event);
 
 public:
     Connection(EventLoop *loop, int fd, uint64_t conn_id);
@@ -70,13 +71,14 @@ public:
     void SetMessageCallback(const MessageCallback &cb);
     void SetCloseCallback(const CloseCallback &cb);
     void SetAnyCallback(const AnyCallback &cb);
+    void SetServerCloseCallback(const CloseCallback &cb);
 
     // 单位为秒
     void SetInactiveClose(bool enable, uint64_t sec);
     // 常用于http升级到websocket
     void SwitchProtocol(const Any &context, const ConnectedCallback &conn,
-                              const MessageCallback &msg, const CloseCallback &closed,
-                              const AnyCallback &event);
+                        const MessageCallback &msg, const CloseCallback &closed,
+                        const AnyCallback &event);
 
     int GetSocketfd() const;
     uint64_t GetConnId() const;

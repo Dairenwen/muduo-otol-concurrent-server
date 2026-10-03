@@ -87,8 +87,8 @@ void TcpServer::NewConnection(int client_fd)
     }
 
     // Connection 必须在所属 Loop 线程创建，否则它注册 Channel/Poller 时会跨线程操作。
-    loop->QueueInLoop([this, client_fd, conn_id, loop]()
-                      {
+    loop->RunInLoop([this, client_fd, conn_id, loop]()
+                    {
                           try
                           {
                               auto connection = std::make_shared<Connection>(loop, client_fd, conn_id);
@@ -101,6 +101,10 @@ void TcpServer::NewConnection(int client_fd)
                               connection->SetMessageCallback(_message_callback);
                               connection->SetAnyCallback(_any_callback);
                               connection->SetCloseCallback(_close_callback);
+                              connection->SetServerCloseCallback([this](const ConnPtr &conn)
+                              {
+                                  RemoveConnection(conn);
+                              });
                               connection->Established();
 
                               if (_enable_inactive_realse && _timeout > 0)
@@ -114,8 +118,13 @@ void TcpServer::NewConnection(int client_fd)
                           } });
 }
 
-void TcpServer::EnableInactiveRelease(int timeout)
+void TcpServer::EnableInactiveRelease(uint64_t timeout)
 {
+    if (timeout < 1 || timeout >= 60)
+    {
+        ERR_LOG("inactive timeout must be between 1 and 59 seconds");
+        return;
+    }
     _timeout = timeout;
     _enable_inactive_realse = true;
 }
@@ -129,7 +138,7 @@ void TcpServer::RemoveConnection(const ConnPtr &conn)
                                 std::lock_guard<std::mutex> lock(_conns_mutex);
                                 _conns.erase(id);
                             }
-                            INF_LOG("%d 号连接已经被删除",conn->GetConnId()); });
+                            INF_LOG("%llu 号连接已经被删除",static_cast<unsigned long long>(conn->GetConnId())); });
 }
 
 void TcpServer::RunAfterInLoop(const TaskFunc &task, int sec)
@@ -139,6 +148,12 @@ void TcpServer::RunAfterInLoop(const TaskFunc &task, int sec)
 
 void TcpServer::RunAfter(const TaskFunc &task, int sec)
 {
+    if (sec < 1 || sec >= 60)
+    {
+        ERR_LOG("RunAfter delay must be between 1 and 59 seconds");
+        return;
+    }
+
     _mainloop.RunInLoop([this, task, sec]
                         { RunAfterInLoop(task, sec); });
 }

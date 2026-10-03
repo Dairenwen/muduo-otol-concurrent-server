@@ -40,7 +40,7 @@ public:
     void StartServer();
     void StopServer();
     void SetThreadCount(int count);
-    void EnableInactiveRelease(int timeout);
+    void EnableInactiveRelease(uint64_t timeout);
     void SetConnectedCallback(const ConnectedCallback &cb);
     void SetMessageCallback(const MessageCallback &cb);
     void SetCloseCallback(const CloseCallback &cb);

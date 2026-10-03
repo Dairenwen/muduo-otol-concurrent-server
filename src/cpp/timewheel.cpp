@@ -101,6 +101,11 @@ void TimeWheel::RemoveTimer(uint64_t id)
 // 防止其他线程引发线程安全问题，将任务的添加、刷新、取消和执行都放在 EventLoop 所在线程中完成。
 void TimeWheel::AddTask(uint64_t id, uint64_t timeout, TaskFunc task_cb)
 {
+    if (timeout == 0 || timeout >= static_cast<uint64_t>(_capacity))
+    {
+        ERR_LOG("TimeWheel timeout must be between 1 and 59 seconds");
+        return;
+    }
     // 其他线程只投递操作；槽位和任务表统一由 EventLoop 所在线程修改。
     _loop->RunInLoop([this, id, timeout, task_cb]()
                      { AddTaskInLoop(id, timeout, task_cb); });
@@ -125,7 +130,10 @@ void TimeWheel::RefreshTaskInLoop(uint64_t id)
     if (_task_map.find(id) != _task_map.end())
     {
         PtrTask pt = _task_map[id].lock(); // 根据weakptr构造shareptr，引用计数+1
-        _slots[(_tick + pt->GetDelayTime()) % _capacity].push_back(pt);
+        if (pt == nullptr)                 // 如果为空，任务已不存在，删除
+            _task_map.erase(id);
+        else
+            _slots[(_tick + pt->GetDelayTime()) % _capacity].push_back(pt);
     }
 }
 
@@ -155,8 +163,11 @@ void TimeWheel::RunTimerTaskInLoop()
 {
     // 每秒都要执行到时的任务
     _tick = (_tick + 1) % _capacity;
+    // 防止clear时又向其中插入数据，将任务一次性取出之后再执行；
+    std::vector<PtrTask> expired;
+    expired.swap(_slots[_tick]);
     // 清空当前槽位的任务，每个任务sharedptr-1，如果为0，触发析构函数执行任务
-    _slots[_tick].clear();
+    expired.clear();
 }
 
 bool TimeWheel::HasTimer(uint64_t id)

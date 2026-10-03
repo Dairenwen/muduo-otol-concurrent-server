@@ -161,8 +161,24 @@ void Connection::Release() // 真正释放连接
     _channel->DisableAll();
     _channel->Remove(); // 先移除 epoll 监控，再关闭 fd
     _socket.Close();
-    if (_close_callback)
-        _close_callback(shared_from_this());
+    auto self = shared_from_this();
+
+    try
+    {
+        if (_close_callback)
+            _close_callback(self);
+    }
+    catch (const std::exception &e)
+    {
+        ERR_LOG("close callback failed: %s", e.what());
+    }
+    catch (...)
+    {
+        ERR_LOG("close callback failed with unknown exception");
+    }
+    // 不仅要调用用户设置的回调函数还需要调用服务器回调来释放连接；
+    if (_server_close_callback)
+        _server_close_callback(self);
 }
 
 void Connection::HandleAny()
@@ -195,6 +211,11 @@ void Connection::SetCloseCallback(const CloseCallback &cb)
 void Connection::SetAnyCallback(const AnyCallback &cb)
 {
     _any_callback = cb;
+}
+
+void Connection::SetServerCloseCallback(const CloseCallback &cb)
+{
+    _server_close_callback = cb;
 }
 
 void Connection::SetInactiveClose(bool enable, uint64_t sec)

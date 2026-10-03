@@ -15,6 +15,12 @@ Acceptor::Acceptor(EventLoop *loop, const std::string &ip, uint16_t port)
     if (!_socket.CreateServer(ip, port))
         throw std::runtime_error("Acceptor failed to create listening socket");
 
+    // 将监听socker设置成非阻塞，防止主reactor阻塞
+    const int listen_fd = _socket.GetSocketFd();
+    const int flags = fcntl(listen_fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) == -1)
+        throw std::runtime_error("failed to make listening socket nonblocking");
+
     // 这个 Channel 监听的是 listen fd；它与每条 Connection 的 Channel 不同。
     _channel = std::make_shared<Channel>(_loop->GetPoller(), _socket.GetSocketFd());
     _channel->SetReadCallbck(std::bind(&Acceptor::HandleRead, this));
