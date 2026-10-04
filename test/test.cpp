@@ -11,6 +11,9 @@
 #include "acceptor.hpp"
 #include "loopthread.hpp"
 #include "LoopThreadPool.hpp"
+#include "util.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <assert.h>
 #include <memory>
@@ -1369,6 +1372,164 @@ void testwebbench()
     server.StartServer();
 }
 
+void testutil()
+{
+    size_t checks = 0;
+    auto require = [&](bool condition, const std::string &message)
+    {
+        ++checks;
+        if (!condition)
+            throw std::runtime_error("[FAIL] Util: " + message);
+    };
+
+    // 1. 字符串分割：完整分隔符、连续分隔符、空输入和结果覆盖。
+    std::vector<std::string> parts = {"旧数据"};
+    auto check_split = [&](const std::string &input, const std::string &separator,
+                           const std::vector<std::string> &expected)
+    {
+        const size_t count = Util::Split(input, separator, parts);
+        require(count == expected.size() && parts == expected,
+                "Split 内容或返回数量错误");
+    };
+    check_split("a/b/c", "/", {"a", "b", "c"});
+    check_split("/a//b/", "/", {"a", "b"});
+    check_split("::a::::b::", "::", {"a", "b"});
+    check_split("a:b::c", "::", {"a:b", "c"});
+    check_split("abc", "/", {"abc"});
+    check_split("///", "/", {});
+    check_split("", "/", {});
+    check_split("abc", "", {"abc"});
+    check_split("", "", {});
+    check_split(std::string("a\0b/c", 5), "/", {std::string("a\0b", 3), "c"});
+    std::cout << "[PASS] Split：分隔符、空项、二进制字符串、结果覆盖\n";
+
+    // 2. URL 编解码：校验明确的编码结果，以及 UTF-8、全部字节的往返。
+    std::string encoded, decoded;
+    const std::string safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+    require(Util::UrlEncode(safe, encoded) && encoded == safe, "安全字符应原样保留");
+    require(Util::UrlEncode("a b+c/?#%=&", encoded) &&
+                encoded == "a%20b%2Bc%2F%3F%23%25%3D%26",
+            "特殊字符编码错误");
+    require(Util::UrlEncode("a b+c", encoded, true) && encoded == "a+b%2Bc",
+            "表单模式空格或加号编码错误");
+    require(Util::UrlDecode(encoded, decoded, true) && decoded == "a b+c",
+            "表单模式解码错误");
+    require(Util::UrlDecode("a+b%2Bc", decoded) && decoded == "a+b+c",
+            "默认模式应保留加号");
+    require(Util::UrlDecode("%2f%2F%4a%4A", decoded) && decoded == "//JJ",
+            "十六进制大小写解码错误");
+    require(Util::UrlDecode("%252e", decoded) && decoded == "%2e", "应只解码一次");
+    require(Util::UrlEncode("中文", encoded) && encoded == "%E4%B8%AD%E6%96%87",
+            "UTF-8 中文编码错误");
+    require(Util::UrlDecode(encoded, decoded) && decoded == "中文", "UTF-8 中文往返失败");
+    std::string bytes;
+    for (int i = 0; i < 256; ++i)
+        bytes.push_back(static_cast<char>(i));
+    for (bool form_mode : {false, true})
+    {
+        require(Util::UrlEncode(bytes, encoded, form_mode), "全部字节编码失败");
+        require(Util::UrlDecode(encoded, decoded, form_mode) && decoded == bytes,
+                "全部 256 种字节往返不一致");
+    }
+    encoded = decoded = "旧数据";
+    require(Util::UrlEncode("", encoded) && encoded.empty(), "空输入编码应清空结果");
+    require(Util::UrlDecode("", decoded) && decoded.empty(), "空输入解码应清空结果");
+    for (const std::string &bad : {"%", "%0", "%GG", "%0G", "%G0", "ok%20bad%"})
+    {
+        decoded = "保留原值";
+        require(!Util::UrlDecode(bad, decoded), "非法编码应失败：" + bad);
+        require(decoded == "保留原值", "解码失败不应修改结果");
+    }
+    std::string inplace = "中文 +/%";
+    const std::string original = inplace;
+    require(Util::UrlEncode(inplace, inplace), "原地编码失败");
+    require(Util::UrlDecode(inplace, inplace) && inplace == original, "原地编解码往返失败");
+    std::cout << "[PASS] URL：特殊字符、中文、256 种字节、非法编码、原地转换\n";
+
+    // 3. 状态码：覆盖各响应类别，未知值应使用默认描述。
+    for (const auto &item : std::vector<std::pair<int, std::string>>{
+             {100, "Continue"}, {200, "OK"}, {201, "Created"}, {204, "No Content"}, {301, "Moved Permanently"}, {304, "Not Modified"}, {400, "Bad Request"}, {403, "Forbidden"}, {404, "Not Found"}, {500, "Internal Server Error"}, {503, "Service Unavailable"}})
+        require(Util::StatusDesc(item.first) == item.second,
+                "状态码描述错误：" + std::to_string(item.first));
+    for (int unknown : {-1, 0, 199, 600, 999})
+        require(Util::StatusDesc(unknown) == "Unknown", "未知状态码默认值错误");
+    std::cout << "[PASS] StatusDesc：各类响应和未知状态码\n";
+
+    // 4. MIME：按当前接口契约，传入文件名，后缀大小写精确匹配。
+    for (const auto &item : std::vector<std::pair<std::string, std::string>>{
+             {"index.html", "text/html"}, {"a.b.txt", "text/plain"}, {"/images/a.png", "image/png"}, {"style.css", "text/css"}, {"app.js", "application/javascript"}, {"data.json", "application/json"}, {"a.svg", "image/svg+xml"}, {"archive.tar.gz", "application/gzip"}, {"font.woff2", "font/woff2"}, {"sheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}, {"archive.7z", "application/x-7z-compressed"}})
+        require(Util::ExtMime(item.first) == item.second, "MIME 错误：" + item.first);
+    for (const std::string &unknown : {"", "README", "file.", "file.unknown", "INDEX.HTML"})
+        require(Util::ExtMime(unknown) == "application/octet-stream", "MIME 默认值错误：" + unknown);
+    std::cout << "[PASS] ExtMime：常见后缀、多点文件名、大小写和默认值\n";
+
+    // 5. 路径检查：允许根目录内回退，拒绝越界及特殊路径字节。
+    for (const std::string &valid : {"/", ".", "./", "a", "/a/b", "/a//./b/",
+                                     "a/..", "/a/../b", "/a/b/../../", "...", "a..b"})
+        require(Util::ValidPath(valid), "合法路径被拒绝：" + valid);
+    for (const std::string &invalid : {"", "..", "../a", "/../a", "a/../../b",
+                                       "/a/b/../../../", "a\\b"})
+        require(!Util::ValidPath(invalid), "非法路径未被拒绝：" + invalid);
+    require(!Util::ValidPath(std::string("/a\0/b", 5)), "应拒绝路径中的 NUL");
+    require(Util::UrlDecode("/%2e%2e/secret", decoded) && !Util::ValidPath(decoded),
+            "解码后的目录越界未被拒绝");
+    require(Util::UrlDecode("/a/%2E%2E/b", decoded) && Util::ValidPath(decoded),
+            "解码后的合法回退被拒绝");
+    require(Util::UrlDecode("/a%00b", decoded) && !Util::ValidPath(decoded),
+            "解码后的 NUL 未被拒绝");
+    std::cout << "[PASS] ValidPath：目录深度、越界、NUL、URL 解码后检查\n";
+
+    // 6. 文件操作：使用唯一临时文件，不覆盖项目文件。
+    char temp_name[] = "/tmp/muduo-util-test-XXXXXX";
+    const int fd = mkstemp(temp_name);
+    require(fd >= 0, "无法创建临时文件");
+    struct TempFile
+    {
+        std::string path;
+        bool removed = false;
+        ~TempFile()
+        {
+            if (!removed)
+                std::remove(path.c_str());
+        }
+    } temp{temp_name};
+    require(close(fd) == 0, "临时文件描述符关闭失败");
+    const std::string missing = temp.path + ".missing";
+    require(Util::IsRegular(temp.path) && !Util::IsDirectory(temp.path), "普通文件类型判断错误");
+    require(Util::IsDirectory("/tmp") && !Util::IsRegular("/tmp"), "目录类型判断错误");
+    require(!Util::IsRegular(missing) && !Util::IsDirectory(missing), "不存在的路径类型判断错误");
+    const std::string nul_path = temp.path + std::string("\0suffix", 7);
+    require(!Util::IsRegular(nul_path) && !Util::IsDirectory(nul_path), "应拒绝含 NUL 的文件路径");
+
+    auto check_file = [&](const std::string &data)
+    {
+        require(Util::WriteFile(temp.path, data), "写文件失败");
+        decoded = "旧内容";
+        require(Util::ReadFile(temp.path, decoded) && decoded == data, "文件内容不一致");
+        struct stat info{};
+        require(stat(temp.path.c_str(), &info) == 0 &&
+                    info.st_size == static_cast<off_t>(data.size()),
+                "文件长度错误或旧内容未截断");
+    };
+    check_file("第一行\n第二行\r\n");
+    check_file(bytes);                         // 包括 NUL 和高位字节。
+    check_file(std::string(1024 * 1024, 'x')); // 1 MiB 文件。
+    check_file("短内容");                      // 验证覆盖大文件后没有残留。
+    check_file("");
+    decoded = "保留原值";
+    require(!Util::ReadFile(missing, decoded) && decoded == "保留原值", "读取不存在文件的行为错误");
+    require(!Util::ReadFile("/tmp", decoded) && decoded == "保留原值", "不应读取目录");
+    require(!Util::ReadFile(nul_path, decoded) && decoded == "保留原值", "不应读取含 NUL 的路径");
+    require(!Util::WriteFile(nul_path, "x"), "不应写入含 NUL 的路径");
+    require(!Util::WriteFile("/tmp", "x"), "不应写入目录");
+    require(!Util::WriteFile(temp.path + "/child", "x"), "父路径为普通文件时应写入失败");
+    require(std::remove(temp.path.c_str()) == 0, "删除测试临时文件失败");
+    temp.removed = true;
+    require(!Util::IsRegular(temp.path), "删除后的文件不应存在");
+    std::cout << "[PASS] 文件操作：文本、二进制、空文件、大文件、覆盖、失败分支" << std::endl;
+    std::cout << "[PASS] Util 全部测试通过" << std::endl;
+}
+
 int main()
 {
     // testtimerfd();
@@ -1383,6 +1544,7 @@ int main()
     // testacceptor();
     // testloopthreadpoll();
     // testtcpserver();
-    testwebbench();
+    // testwebbench();
+    testutil();
     return 0;
 }

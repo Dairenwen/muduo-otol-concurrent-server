@@ -70,6 +70,7 @@ private:
         DBG_LOG("echo bytes=%llu", static_cast<unsigned long long>(size));
         // 按实际长度回显，支持二进制以及分段到达的数据。
         cn->Send(bf.ReadAsStringAndPop(size));
+        cn->Shutdown();
     };
 
 public:

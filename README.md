@@ -411,6 +411,51 @@ EventLoop 包含：
 3. 启动BaseLoop。
 
 
+#### HTTP协议模块
+
+HTTP协议模块用于对高并发服务器模块进行协议支持，基于提供的协议支持能够更方便的完成指定协议服务器的搭建。细分为以下几个模块：
+
+#### Util模块
+
+这个模块是一个工具模块，主要提供HTTP协议模块所用到的一些工具函数：
+
+- 功能
+  - 实现一些零碎的功能性工具接口
+  - 读取文件内容
+  - 向文件写入内容
+  - URL编码
+  - URL解码
+  - HTTP状态码及描述信息
+  - 根据文件后缀名获取 MIME 类型
+  - 判断一个文件是否是目录
+  - 判断一个文件是否是普通文件
+  - HTTP资源路径的有效性判断
+
+
+
+
+
+#### HttpRequest模块
+
+这个模块是HTTP请求数据模块，用于保存HTTP请求数据被解析后的各项请求元素信息。
+
+#### HttpResponse模块
+
+这个模块是HTTP响应数据模块，用于业务处理后设置并保存HTTP响应数据的各项元素信息，最终会被按照HTTP协议响应格式组织成为响应信息发送给客户端。
+
+#### HttpContext模块
+
+这个模块是一个HTTP请求接收的上下文模块，主要是为了防止在一次接收的数据中，不是一个完整的HTTP请求，则解析过程并未完成，无法进行完整的请求处理，需要在下次接收到新数据后继续根据上下文进行解析，最终得到一个HttpRequest请求信息对象，因此在请求数据的接收以及解析部分需要一个上下文来进行控制接收和处理节奏。
+
+#### HttpServer模块
+
+这个模块是最终给组件使用者提供的HTTP服务器模块了，用于以简单的接口实现HTTP服务器的搭建。
+
+HttpServer模块内部包含有一个TcpServer对象：TcpServer对象实现服务器的搭建。
+
+HttpServer模块内部包含有两个提供给TcpServer对象的接口：连接建立成功设置上下文接口、数据处理接口。
+
+HttpServer模块内部包含有一个hash-map表存储请求与处理函数的映射表：组件使用者向HttpServer设置哪些请求应该使用哪些函数进行处理，等TcpServer收到对应的请求就会使用对应的函数进行处理。
 
 
 
@@ -1212,3 +1257,134 @@ make webbench CFLAGS='-Wall -O2 -I/usr/include/tirpc'
 输出中的 pages/min 是每分钟请求尝试数量的换算：此版本源码使用 `(成功数 + 失败数) / (秒数 / 60)`。所以失败多时也可能有很高的 Speed，必须同时看失败数。bytes/sec 是读到的字节数除以测试时间，包含 HTTP 响应头。它没有校验 HTTP 状态码及业务内容，不能把 succeed 理解成 HTTP 200 或业务正确。
 
 参考：[镜像 README](https://github.com/tamlok/webbench)、[源码](https://github.com/tamlok/webbench/blob/master/webbench.c)、[FreeBSD Webbench 说明](https://www.freshports.org/benchmarks/webbench/)。
+
+#### EchoServer中的回调关系
+
+
+1. **`EchoServer::EchoServer()`：把业务函数交给 `_server`。**
+
+```cpp
+_server.SetConnectedCallback(
+    std::bind(&EchoServer::Onconnected, this, std::placeholders::_1));
+_server.SetCloseCallback(
+    std::bind(&EchoServer::Onclosed, this, std::placeholders::_1));
+_server.SetMessageCallback(
+    std::bind(&EchoServer::Onmessaged, this,
+                std::placeholders::_1, std::placeholders::_2));
+```
+
+TcpServer 的三个 setter 分别将函数保存到 `_connected_callback`、`_close_callback`、`_message_callback`。`_1` 接收连接对象，消息回调的 `_2` 接收输入 Buffer。
+
+2. **`TcpServer::TcpServer()` 和 `Acceptor::Acceptor()`：连接接入链路的两次绑定。**
+
+TcpServer 设置：
+
+```cpp
+_acceptor.SetAcceptCallbak([this](int client_fd) {
+    NewConnection(client_fd);
+});
+```
+
+`Acceptor::SetAcceptCallbak()` 将它保存到 **`_accpet_callback`**，Acceptor 设置自己的监听 Channel：
+
+```cpp
+_channel->SetReadCallbck(
+    std::bind(&Acceptor::HandleRead, this));
+```
+
+监听 fd 可读后的调用链：
+
+```text
+Channel::HandleEvent()
+→ Channel::_read_callback()
+→ Acceptor::HandleRead()
+→ _socket.Accept()
+→ _accpet_callback(client_fd)
+→ TcpServer::NewConnection(client_fd)
+```
+
+3. **`TcpServer::NewConnection()`：为每个 Connection 下发回调。**
+
+先通过 `_pool.NextLoop()` 选择 Loop，再用 `loop->RunInLoop()` 在所属线程创建 `connection`，放入 `_conns[conn_id]`，然后设置：
+
+| 实际设置语句 | Connection 中保存的位置 |
+|---|---|
+| `connection->SetConnectedCallback(_connected_callback)` | `_connected_callback` |
+| `connection->SetMessageCallback(_message_callback)` | `_message_callback` |
+| `connection->SetCloseCallback(_close_callback)` | `_close_callback` |
+| `connection->SetAnyCallback(_any_callback)` | `_any_callback` |
+| `connection->SetServerCloseCallback(...)` | `_server_close_callback` |
+
+最后一项绑定的是 `TcpServer::RemoveConnection(conn)`，用于服务器内部回收，和业务函数 `EchoServer::Onclosed()` 分开保存。
+
+4. **`Connection::EstablishedInLoop()`：把底层 Channel 事件绑定到 Connection 的处理函数。**
+
+`connection->Established()` 经 `_loop->RunInLoop()` 进入 `EstablishedInLoop()`，这里设置：
+
+| Channel 的 setter | 保存成员 | 最终调用 |
+|---|---|---|
+| `SetReadCallbck()` | `_read_callback` | `Connection::HandleRead()` |
+| `SetWriteCallbck()` | `_write_callback` | `Connection::HandleWrite()` |
+| `SetCloseCallbck()` | `_close_callback` | `Connection::HandleClose()` |
+| `SetErrorCallbck()` | `_error_callback` | `Connection::HandleClose()` |
+| `SetEventCallbck()` | `_event_callback` | `Connection::HandleAny()` |
+
+这些 lambda 捕获 `weak`，先 `weak.lock()` 再调用函数。之后 `_channel->Update()` 注册读监听，并执行：
+
+```text
+Connection::_connected_callback(shared_from_this())
+→ EchoServer::Onconnected()
+```
+
+5. **收到数据：Channel 的读回调转到业务消息回调。**
+
+```text
+Channel::HandleEvent()
+→ _read_callback()
+→ Connection::HandleRead()
+→ _socket.Recv()
+→ _In_buffer.WriteAndPush()
+→ _message_callback(shared_from_this(), _In_buffer)
+→ EchoServer::Onmessaged()
+```
+
+当前 `Onmessaged()` 用 `bf.ReadAsStringAndPop(size)` 取出并消费数据，再调用 `cn->Send()`。`Send()` 经 `RunInLoop()` 进入 `SendInLoop()`，将数据写入 **`_Out_buffer`**，通过 `EnableWrite()` 和 `Update()` 开启写监听。
+
+**实际发送发生在写回调：**
+
+```text
+Channel::_write_callback()
+→ Connection::HandleWrite()
+→ _socket.Send()
+→ _Out_buffer.MoveReaderPtr()
+```
+
+6. **关闭连接：业务通知和内部删除分别执行。**
+
+当前 `Onmessaged()` 还调用 `cn->Shutdown()`，进入 `ShutdownInLoop()`：将 `_statu` 改为 `DISCONNECTING`；若还有输出数据，等待 `HandleWrite()` 发完再调用 `Release()`。
+
+`Release()` 清理定时任务、Channel 和 socket 后，依次调用：
+
+```text
+_close_callback(self)
+→ EchoServer::Onclosed()              // 业务关闭通知
+
+_server_close_callback(self)
+→ TcpServer::RemoveConnection(conn)
+→ _mainloop.RunInLoop(...)
+→ _conns.erase(id)                    // 服务器移除连接
+```
+
+7. **任意事件与空闲超时：`HandleAny()` 负责刷新任务。**
+
+`NewConnection()` 调用 `connection->SetInactiveClose(true, _timeout)`，由 `SetInactiveCloseInLoop()` 添加以 `_conn_id` 为 ID 的任务，到期调用 `HandleClose()`。
+
+正常有事件时：
+
+```text
+Channel::_event_callback()
+→ Connection::HandleAny()
+→ _loop->RefreshTask(_conn_id)
+→ 若设置了 _any_callback，再调用它
+```
+
