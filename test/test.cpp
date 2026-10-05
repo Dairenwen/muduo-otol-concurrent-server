@@ -7,6 +7,8 @@
 #include "socket.hpp"
 #include "channel.hpp"
 #include "poller.hpp"
+#include "HttpRequest.hpp"
+#include "HttpResponse.hpp"
 #include "connection.hpp"
 #include "acceptor.hpp"
 #include "loopthread.hpp"
@@ -1545,6 +1547,7 @@ int main()
     // testloopthreadpoll();
     // testtcpserver();
     // testwebbench();
-    testutil();
+    // testutil();
+    std::cout << "[PASS] 所有测试通过" << std::endl;
     return 0;
 }

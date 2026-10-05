@@ -432,12 +432,69 @@ HTTP协议模块用于对高并发服务器模块进行协议支持，基于提�
   - HTTP资源路径的有效性判断
 
 
-
-
-
 #### HttpRequest模块
 
 这个模块是HTTP请求数据模块，用于保存HTTP请求数据被解析后的各项请求元素信息。
+
+一个 HTTP 请求主要包含：
+
+- **请求方法**：`GET`、`POST` 等
+- **资源路径**：如 `/search/1234`
+- **查询字符串**：如 `word=C%2B%2B&en=utf8`
+- **协议版本**：如 `HTTP/1.1`
+- **请求头**：如 `Host`、`Content-Length`、`Connection`
+- **请求正文**：POST 等请求携带的数据
+
+示例：
+
+```http
+GET /search/1234?word=C%2B%2B&en=utf8 HTTP/1.1
+Host: localhost:8080
+Content-Length: 0
+Connection: keep-alive
+
+```
+
+解析后可表示为：
+
+```text
+method   = GET
+path     = /search/1234
+version  = HTTP/1.1
+
+params:
+    word = C++
+    en   = utf8
+
+headers:
+    Host           = localhost:8080
+    Content-Length = 0
+    Connection     = keep-alive
+```
+
+私有成员：
+
+```cpp
+std::string _method;      // 请求方法
+std::string _path;        // 资源路径
+std::string _version;     // HTTP 协议版本
+std::string _body;        // 请求正文
+
+std::unordered_map<std::string, std::string> _params;   // 查询参数
+std::unordered_map<std::string, std::string> _headers;  // 请求头
+
+std::smatch _matches;     // 正则路由匹配结果
+```
+
+`HttpRequest` 主要提供以下能力：
+
+1. 获取请求方法、资源路径、协议版本和正文。
+2. 查询、获取和设置 URL 查询参数。
+3. 查询、获取和设置 HTTP 请求头。
+4. 获取 `Content-Length`，辅助判断请求正文是否接收完整。
+5. 根据 `Connection` 和 HTTP 版本判断是否保持长连接。
+6. 保存正则路由匹配结果，方便获取路径参数。
+
 
 #### HttpResponse模块
 
