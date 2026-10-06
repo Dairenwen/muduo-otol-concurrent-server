@@ -9,6 +9,7 @@
 #include "poller.hpp"
 #include "HttpRequest.hpp"
 #include "HttpResponse.hpp"
+#include "HttpContext.hpp"
 #include "connection.hpp"
 #include "acceptor.hpp"
 #include "loopthread.hpp"
@@ -1532,6 +1533,220 @@ void testutil()
     std::cout << "[PASS] Util 全部测试通过" << std::endl;
 }
 
+void testhttp()
+{
+    size_t checks = 0, cases = 0, failures = 0;
+    // 不依赖 assert，Release 构建也执行检查；一个用例失败不阻止其他用例。
+    auto require = [&](bool ok, const std::string &message)
+    {
+        ++checks;
+        if (!ok)
+            throw std::runtime_error(message);
+    };
+    auto run = [&](const std::string &name, const auto &test)
+    {
+        ++cases;
+        // 将用例名中的换行显示成转义字符，让每条日志保持在同一行。
+        std::string label;
+        for (char ch : name)
+            label += ch == '\r' ? "\\r" : ch == '\n' ? "\\n" : std::string(1, ch);
+        INF_LOG("[HTTP RUN] %s", label.c_str());
+        try
+        {
+            test();
+            INF_LOG("[HTTP PASS] %s", label.c_str());
+        }
+        catch (const std::exception &error)
+        {
+            ++failures;
+            ERR_LOG("[HTTP FAIL] %s: %s", label.c_str(), error.what());
+        }
+    };
+    // 只使用内存 Buffer，不启动服务器或建立 TCP 连接。
+    auto parse = [&](HttpContext &context, Buffer &buffer, const std::string &data)
+    {
+        buffer.WriteStringAndPush(data);
+        context.RecvHttpRequest(buffer);
+    };
+
+    run("HttpRequest：请求头、参数、覆盖与清空", [&]
+        {
+        HttpRequest request;
+        std::string key = "X-Test", param = "name", value = "中文", missing = "missing";
+        require(!request.HasHeader(key) && request.GetHeader(key).empty(), "缺失请求头行为错误");
+        request.SetHeader(key, "first");
+        request.SetHeader(key, "second");
+        require(request.HasHeader(key) && request.GetHeader(key) == "second", "请求头覆盖失败");
+        request.SetParam(param, value);
+        require(request.HasParam(param) && request.GetParam(param) == value, "参数保存失败");
+        value = "";
+        request.SetParam(param, value);
+        require(request.HasParam(param) && request.GetParam(param).empty(), "空参数应存在");
+        require(!request.HasParam(missing) && request.GetParam(missing).empty(), "缺失参数行为错误");
+        require(request.ContentLength() == 0, "没有正文长度时应为 0");
+        request.SetHeader("Content-Length", "42");
+        require(request.ContentLength() == 42, "正文长度读取错误");
+        request.Clear();
+        require(!request.HasHeader(key) && !request.HasParam(param) && request.ContentLength() == 0,
+                "Clear 未清空请求头或参数"); });
+
+    // 直接使用请求对象时，头字段也应按 HTTP 的大小写不敏感规则查找。
+    run("HttpRequest：请求头名称大小写", [&]
+        {
+        HttpRequest request;
+        request.SetHeader("content-length", "4");
+        require(request.ContentLength() == 4, "小写 content-length 未被识别"); });
+    for (const std::string invalid : {"-1", "+2", "3xyz", "", "18446744073709551616"})
+        run("HttpRequest：非法 Content-Length [" + invalid + "]", [&]
+            {
+            HttpRequest request;
+            request.SetHeader("Content-Length", invalid);
+            bool rejected = false;
+            try { (void)request.ContentLength(); }
+            catch (const std::exception &) { rejected = true; }
+            require(rejected, "非法长度被接受，应拒绝而不是返回有效长度"); });
+
+    run("HttpResponse：响应头、正文类型和字节长度", [&]
+        {
+        HttpResponse response;
+        std::string key = "X-Test", value = "one", missing = "missing";
+        require(!response.HasHeader(missing) && response.GetHeader(missing).empty(), "缺失响应头行为错误");
+        response.SetHeader(key, value);
+        value = "two";
+        response.SetHeader(key, value);
+        require(response.GetHeader(key) == "two", "响应头覆盖失败");
+        std::string type = "application/octet-stream", length = "Content-Length", content_type = "Content-Type";
+        for (std::string body : {std::string("中文"), std::string("a\0b", 3), std::string(1024 * 1024, 'x'), std::string()})
+        {
+            response.SetContent(body, type);
+            require(response.GetHeader(length) == std::to_string(body.size()), "Content-Length 未按字节计算或覆盖失败");
+            require(response.GetHeader(content_type) == type, "Content-Type 设置失败");
+        } });
+    run("HttpResponse：重定向与 ReSet", [&]
+        {
+        HttpResponse response;
+        std::string url = "/login", location = "Location", type = "text/plain", body = "hello", length = "Content-Length";
+        response.SetContent(body, type);
+        response.SetRedirect(url);
+        require(response.HasHeader(location) && response.GetHeader(location) == url, "重定向地址未保存");
+        url = "/new";
+        response.SetRedirect(url, 301);
+        require(response.GetHeader(location) == url, "重定向地址未覆盖");
+        response.ReSet();
+        require(!response.HasHeader(location) && !response.HasHeader(length), "ReSet 未清除响应头"); });
+    run("HttpResponse：显式 keep-alive 与 close", [&]
+        {
+        HttpResponse response;
+        std::string key = "Connection", value = "ClOsE";
+        response.SetHeader(key, value);
+        require(response.Close(), "显式 close 应关闭连接");
+        value = "keep-alive";
+        response.SetHeader(key, value);
+        require(!response.Close(), "显式 keep-alive 仍关闭连接，检查响应版本初始化及设置接口"); });
+
+    for (const std::string method : {"GET", "HEAD", "POST", "PUT", "DELETE"})
+        run("HttpContext：" + method + " 与查询参数", [&]
+            {
+            HttpContext context;
+            Buffer buffer;
+            require(context.RespStatu() == 200 && context.RecvStatu() == RECV_HTTP_LINE, "初始状态错误");
+            parse(context, buffer, method + " /a%20b?q=a%26b&eq=a%3Db&x=a+b&flag&name=%E4%B8%AD%E6%96%87 HTTP/1.1\r\nhost: localhost\r\n\r\n");
+            require(context.RecvStatu() == RECV_HTTP_OVER && context.RespStatu() == 200, "合法请求未完成");
+            std::string q = "q", eq = "eq", x = "x", flag = "flag", name = "name", host = "Host";
+            require(context.Request().GetParam(q) == "a&b", "编码的 & 被错误拆分");
+            require(context.Request().GetParam(eq) == "a=b", "编码的 = 解码错误");
+            require(context.Request().GetParam(x) == "a b", "查询参数 + 解码错误");
+            require(context.Request().HasParam(flag) && context.Request().GetParam(flag).empty(), "无等号参数错误");
+            require(context.Request().GetParam(name) == "中文", "中文参数解码错误");
+            require(context.Request().GetHeader(host) == "localhost", "小写 Host 未归一化");
+            require(!context.Request().Close() && buffer.ReadAbleSize() == 0, "HTTP/1.1 默认长连接或缓冲消费错误"); });
+
+    run("HttpContext：跨接收分段、二进制正文与下一条请求", [&]
+        {
+        HttpContext context;
+        Buffer buffer;
+        parse(context, buffer, "POST / HTTP/1.1\r");
+        require(context.RecvStatu() == RECV_HTTP_LINE && buffer.ReadAbleSize() > 0, "半行数据不应消费");
+        parse(context, buffer, "\nHost: local\r\nContent-Len");
+        require(context.RecvStatu() == RECV_HTTP_HEAD, "应等待剩余请求头");
+        parse(context, buffer, "gth: 4\r\n\r\na");
+        require(context.RecvStatu() == RECV_HTTP_BODY, "正文不足应等待");
+        const std::string next = "GET / HTTP/1.0\r\n\r\n";
+        parse(context, buffer, std::string("\0bc", 3) + next);
+        require(context.RecvStatu() == RECV_HTTP_OVER && context.Request().ContentLength() == 4, "二进制正文未完成");
+        require(buffer.ReadAbleSize() == next.size() && buffer.ReadAsString(next.size()) == next, "误消费下一条请求");
+        context.RecvHttpRequest(buffer);
+        require(buffer.ReadAbleSize() == next.size(), "完成状态不应继续消费");
+        context.Clear();
+        require(context.RecvStatu() == RECV_HTTP_LINE && context.Request().ContentLength() == 0, "上下文重置错误");
+        context.RecvHttpRequest(buffer);
+        require(context.RecvStatu() == RECV_HTTP_OVER && context.Request().Close(), "HTTP/1.0 请求或默认短连接错误"); });
+    run("HttpContext：逐字节接收", [&]
+        {
+        HttpContext context;
+        Buffer buffer;
+        const std::string data = "POST /?x=1 HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc";
+        for (size_t i = 0; i < data.size(); ++i)
+        {
+            parse(context, buffer, data.substr(i, 1));
+            require(context.RecvStatu() != RECV_HTTP_ERROR, "逐字节解析失败");
+            require((context.RecvStatu() == RECV_HTTP_OVER) == (i + 1 == data.size()), "完成时间错误");
+        } });
+    for (const auto &item : std::vector<std::pair<std::string, bool>>{
+             {"HTTP/1.0\r\nConnection: keep-alive", false},
+             {"HTTP/1.1\r\nHost: a\r\nConnection: ClOsE", true},
+             {"HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, close", true}})
+        run("HttpRequest：连接策略 [" + item.first + "]", [&]
+            {
+            HttpContext context;
+            Buffer buffer;
+            parse(context, buffer, "GET / " + item.first + "\r\n\r\n");
+            require(context.RecvStatu() == RECV_HTTP_OVER, "连接策略请求未解析完成");
+            require(context.Request().Close() == item.second, "Connection 列表或大小写处理错误"); });
+
+    // 每个错误输入使用全新上下文；拒绝后再次调用不应继续消费缓冲区。
+    auto reject = [&](const std::string &name, const std::string &input, int status)
+    {
+        run("HttpContext：拒绝 " + name, [&]
+            {
+            HttpContext context;
+            Buffer buffer;
+            parse(context, buffer, input);
+            require(context.RecvStatu() == RECV_HTTP_ERROR, "非法请求未进入错误状态");
+            require(context.RespStatu() == status, "错误状态码不正确");
+            const size_t remaining = buffer.ReadAbleSize();
+            context.RecvHttpRequest(buffer);
+            require(buffer.ReadAbleSize() == remaining, "错误状态仍在消费数据"); });
+    };
+    reject("不支持的方法", "PATCH / HTTP/1.1\r\n", 400);
+    reject("不支持的版本", "GET / HTTP/2.0\r\n", 400);
+    reject("空路径", "GET  HTTP/1.1\r\n", 400);
+    reject("目录越界", "GET /%2e%2e/x HTTP/1.1\r\n", 400);
+    reject("错误百分号编码", "GET /bad%GG HTTP/1.1\r\n", 400);
+    reject("缺少 Host", "GET / HTTP/1.1\r\n\r\n", 400);
+    reject("重复 Host", "GET / HTTP/1.1\r\nHost: a\r\nhost: b\r\n", 400);
+    reject("非法头字段名", "GET / HTTP/1.1\r\nHost: a\r\nBad Key: x\r\n", 400);
+    for (const std::string length : {"-1", "+1", "1x", "", "18446744073709551616"})
+        reject("非法正文长度 [" + length + "]", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: " + length + "\r\n", 400);
+    reject("重复正文长度", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\ncontent-length: 1\r\n", 400);
+    reject("超大正文", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 16777217\r\n", 413);
+    reject("chunked 未支持", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", 501);
+    reject("冲突的正文边界", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n", 400);
+    reject("超长请求行", "GET /" + std::string(8192, 'a'), 414);
+    reject("超长头字段", "GET / HTTP/1.1\r\nHost: a\r\nX: " + std::string(8192, 'a'), 431);
+    std::string headers = "GET / HTTP/1.1\r\nHost: a\r\n";
+    for (int i = 0; i < 70; ++i)
+        headers += "X: " + std::string(1000, 'a') + "\r\n";
+    reject("请求头总量超限", headers, 431);
+    reject("头字段缺少 CR", "GET / HTTP/1.1\r\nHost: a\r\nX-Test: xyz\n\r\n", 400);
+    reject("结束空行仅有 LF", "GET / HTTP/1.1\r\nHost: a\r\n\n", 400);
+
+    INF_LOG("[HTTP SUMMARY] 用例 %zu，检查 %zu，失败用例 %zu", cases, checks, failures);
+    // 当前接口没有方法、路径、正文或响应状态的 getter，无法直接核对这些私有值。
+    if (failures != 0)
+        throw std::runtime_error("HTTP 测试存在 " + std::to_string(failures) + " 个失败用例，请查看日志");
+}
+
 int main()
 {
     // testtimerfd();
@@ -1548,6 +1763,6 @@ int main()
     // testtcpserver();
     // testwebbench();
     // testutil();
-    std::cout << "[PASS] 所有测试通过" << std::endl;
+    testhttp();
     return 0;
 }

@@ -8,6 +8,8 @@
 
 class HttpRequest
 {
+    friend class HttpContext;
+
 private:
     std::string _method;  // 请求方法
     std::string _path;    // 资源路径

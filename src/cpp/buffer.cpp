@@ -101,10 +101,12 @@ std::string Buffer::ReadAsStringAndPop(uint64_t len)
     MoveReaderPtr(len);
     return ret;
 }
+
 char *Buffer::FindCRLF()
 {
     return (char *)memchr(GetReaderPtr(), '\n', ReadAbleSize()); // 找到换行符的位置
 }
+
 std::string Buffer::GetLine()
 {
     char *pos = FindCRLF();
