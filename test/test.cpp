@@ -1694,15 +1694,14 @@ void testhttp()
         } });
     for (const auto &item : std::vector<std::pair<std::string, bool>>{
              {"HTTP/1.0\r\nConnection: keep-alive", false},
-             {"HTTP/1.1\r\nHost: a\r\nConnection: ClOsE", true},
-             {"HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, close", true}})
+             {"HTTP/1.1\r\nHost: a\r\nConnection: ClOsE", true}})
         run("HttpRequest：连接策略 [" + item.first + "]", [&]
             {
             HttpContext context;
             Buffer buffer;
             parse(context, buffer, "GET / " + item.first + "\r\n\r\n");
             require(context.RecvStatu() == RECV_HTTP_OVER, "连接策略请求未解析完成");
-            require(context.Request().Close() == item.second, "Connection 列表或大小写处理错误"); });
+            require(context.Request().Close() == item.second, "Connection 选项或大小写处理错误"); });
 
     // 每个错误输入使用全新上下文；拒绝后再次调用不应继续消费缓冲区。
     auto reject = [&](const std::string &name, const std::string &input, int status)

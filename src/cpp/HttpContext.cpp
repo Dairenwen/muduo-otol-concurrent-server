@@ -45,6 +45,10 @@ bool HttpContext::ReadLine(Buffer &buffer, std::string &line)
     if (end == nullptr)
         return false; // 暂时保存
 
+    // Buffer 查找的是 LF；先验证 CRLF，避免单个 LF 导致长度下溢。
+    if (length < 2 || end[-1] != '\r')
+        return SetError(400);
+    
     line = buffer.GetLine();
     if (_recv_statu == RECV_HTTP_HEAD)
     {
@@ -209,7 +213,7 @@ bool HttpContext::RecvHttpBody(Buffer &buffer)
 
     // 当前正文还缺多少字节。
     const size_t remaining = _body_length - _request._body.size();
-    const size_t count = std::min(remaining, buffer.ReadAbleSize());
+    const size_t count = std::min(remaining, static_cast<size_t>(buffer.ReadAbleSize()));
 
     if (count > 0)
         _request._body.append(buffer.ReadAsStringAndPop(count));

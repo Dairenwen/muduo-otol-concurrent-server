@@ -1,4 +1,5 @@
 #include "HttpRequest.hpp"
+#include <strings.h>
 
 void HttpRequest::SetHeader(const std::string &key, const std::string &val)
 {
@@ -50,12 +51,26 @@ size_t HttpRequest::ContentLength()
 {
     const std::string key = "Content-Length";
 
-    auto it = _headers.find(key);
+    // 长度字段名称不区分大小写，保留原有头字段存储方式。
+    auto it = std::find_if(_headers.begin(), _headers.end(), [&](const auto &header)
+                           { return strcasecmp(header.first.c_str(),
+                                               key.c_str()) == 0; });
 
     // 没有 Content-Length，说明没有正文
     if (it == _headers.end())
     {
         return 0;
+    }
+
+    // stoull 接受符号和尾随字符，转换前要求非空且全部为数字。
+    if (it->second.empty() ||
+        !std::all_of(it->second.begin(), it->second.end(),
+                     [](unsigned char ch)
+                     {
+                         return ch >= '0' && ch <= '9';
+                     }))
+    {
+        throw std::invalid_argument("Invalid Content-Length");
     }
 
     return static_cast<size_t>(std::stoull(it->second));

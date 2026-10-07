@@ -17,7 +17,7 @@ private:
     std::unordered_map<std::string, std::string> _headers; // 响应头字段
 
 public:
-    HttpResponse() : _statu(200), _redirect_flag(false) {}
+    HttpResponse() : _statu(200), _redirect_flag(false), _version("HTTP/1.1") {}
     ~HttpResponse() = default;
 
     // 重置响应对象
