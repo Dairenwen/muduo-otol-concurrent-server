@@ -92,8 +92,7 @@ bool HttpRequest::Close()
     {
         connection = it->second;
 
-        // Connection 的值理论上不区分大小写，
-        // 因此统一转换为小写后再判断。
+        // Connection 的值理论上不区分大小写，因此统一转换为小写后再判断。
         std::transform(connection.begin(), connection.end(), connection.begin(), [](unsigned char ch)
                        { return static_cast<char>(std::tolower(ch)); });
     }

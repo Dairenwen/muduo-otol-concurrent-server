@@ -6,6 +6,8 @@
 
 class HttpResponse
 {
+    friend class HttpServer;
+
 private:
     int _statu;          // HTTP 响应状态码
     bool _redirect_flag; // 是否进行重定向

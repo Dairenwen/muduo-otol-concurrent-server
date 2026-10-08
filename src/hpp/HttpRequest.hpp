@@ -9,6 +9,7 @@
 class HttpRequest
 {
     friend class HttpContext;
+    friend class HttpServer;
 
 private:
     std::string _method;  // 请求方法

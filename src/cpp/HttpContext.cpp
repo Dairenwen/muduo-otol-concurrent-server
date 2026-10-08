@@ -16,12 +16,11 @@ HttpRequest &HttpContext::Request() { return _request; }
 
 void HttpContext::Clear()
 {
-    // 仅重置解析上下文，缓冲区中下一条请求的数据由调用者保留。
     _resp_statu = 200;
     _recv_statu = RECV_HTTP_LINE;
     _head_size = 0;
     _body_length = 0;
-    _request.Clear();
+    _request.Clear(); // 清空解析完的请求信息
 }
 
 bool HttpContext::SetError(int status)
@@ -48,7 +47,7 @@ bool HttpContext::ReadLine(Buffer &buffer, std::string &line)
     // Buffer 查找的是 LF；先验证 CRLF，避免单个 LF 导致长度下溢。
     if (length < 2 || end[-1] != '\r')
         return SetError(400);
-    
+
     line = buffer.GetLine();
     if (_recv_statu == RECV_HTTP_HEAD)
     {
@@ -60,8 +59,8 @@ bool HttpContext::ReadLine(Buffer &buffer, std::string &line)
 
 bool HttpContext::ParseHttpLine(const std::string &line)
 {
-    // 捕获组依次为原串、方法、路径、查询串、版本及 CRLF 后的内容。
-    static const std::regex pattern("(GET|HEAD|POST|PUT|DELETE) ([^?\\s]*)(?:\\?([^\\s]*))? (HTTP/1\\.[01])\\r\\n([\\s\\S]*)");
+    // 捕获组依次为原串、方法、路径、查询串、版本及 CRLF 后的内容，忽略大小写
+    static const std::regex pattern("(GET|HEAD|POST|PUT|DELETE) ([^?\\s]*)(?:\\?([^\\s]*))? (HTTP/1\\.[01])\\r\\n([\\s\\S]*)", std::regex::icase);
     std::smatch matches;
 
     if (!std::regex_match(line, matches, pattern))
@@ -84,8 +83,25 @@ bool HttpContext::ParseHttpLine(const std::string &line)
         return SetError(400);
 
     _request._method = matches[1].str();
+
+    // 统一方法名称
+    std::transform(_request._method.begin(), _request._method.end(),
+                   _request._method.begin(),
+                   [](unsigned char ch)
+                   {
+                       return static_cast<char>(std::toupper(ch));
+                   });
+
     _request._path = std::move(path);
     _request._version = matches[4].str();
+
+    // 统一版本格式
+    std::transform(_request._version.begin(), _request._version.end(),
+                   _request._version.begin(),
+                   [](unsigned char ch)
+                   {
+                       return static_cast<char>(std::toupper(ch));
+                   });
 
     if (matches[3].matched)
     {

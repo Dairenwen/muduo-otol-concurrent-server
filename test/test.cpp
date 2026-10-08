@@ -5,6 +5,7 @@
 #include "any.hpp"
 #include "log.hpp"
 #include "socket.hpp"
+#include "HttpServer.hpp"
 #include "channel.hpp"
 #include "poller.hpp"
 #include "HttpRequest.hpp"
@@ -1549,7 +1550,8 @@ void testhttp()
         // 将用例名中的换行显示成转义字符，让每条日志保持在同一行。
         std::string label;
         for (char ch : name)
-            label += ch == '\r' ? "\\r" : ch == '\n' ? "\\n" : std::string(1, ch);
+            label += ch == '\r' ? "\\r" : ch == '\n' ? "\\n"
+                                                     : std::string(1, ch);
         INF_LOG("[HTTP RUN] %s", label.c_str());
         try
         {
@@ -1746,6 +1748,10 @@ void testhttp()
         throw std::runtime_error("HTTP 测试存在 " + std::to_string(failures) + " 个失败用例，请查看日志");
 }
 
+void testhttpserver()
+{
+}
+
 int main()
 {
     // testtimerfd();
@@ -1762,6 +1768,7 @@ int main()
     // testtcpserver();
     // testwebbench();
     // testutil();
-    testhttp();
+    // testhttp();
+    testhttpserver();
     return 0;
 }
