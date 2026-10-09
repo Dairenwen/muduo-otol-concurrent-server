@@ -1,6 +1,6 @@
 # muduo-otol-concurrent-server
+
 Muduo-inspired C++ high-concurrency server: master-slave Reactor, one-thread-one-loop, with HTTP support.先从了解一下概念开始：
-x
 
 ## 1. 基础框架
 
@@ -8,14 +8,13 @@ x
 
 HTTP 是运行在 TCP 之上的应用层协议，本质上采用**客户端请求、服务器响应**的方式进行通信。因此，实现 HTTP 服务器可以简单分为：**搭建 TCP 服务器 → 按 HTTP 格式解析请求 → 根据请求提供服务 → 按 HTTP 格式返回响应**。项目基于 Reactor 模式实现高性能 HTTP 服务器基础库；开发中也推荐直接使用 `httplib` 等现成 HTTP 库，避免从底层自行实现。
 
-
 ### 1.2 Reactor模型：
 
 **利用 I/O 多路复用统一监听多个连接的事件，事件就绪后再分发给对应的处理线程/逻辑进行处理，因此也叫 Dispatcher 模式。**
 
 Linux 下推荐使用 **`epoll`** 做多路复用。相比 `select/poll`，`epoll` **无需每次重复传递和遍历全部 fd，而是通过就绪事件队列直接获取活跃 fd**，连接数很多、但同时活跃连接较少时性能优势尤其明显。
 
-``` mermaid
+```mermaid
 flowchart TD
     R[Reactor]
 
@@ -30,6 +29,7 @@ flowchart TD
 **分类**：
 
 **单Reactor单线程：单I/O多路复用+业务处理**
+
 1. 通过IO多路复用模型进行客户端请求监控
 2. 触发事件后，进行事件处理
    - a. 如果是新建连接请求，则获取新建连接，并添加至多路复用模型进行事件监控。
@@ -69,7 +69,6 @@ flowchart LR
     P --> R
 ```
 
-
 **多Reactor多线程：多I/O多路复用+线程池（业务处理）**
 
 1. 在主Reactor中处理新连接请求事件，有新连接到来则分发到子Reactor中监控
@@ -93,10 +92,10 @@ flowchart LR
     R1 --> P[Worker线程池]
     R2 --> P
 ```
+
 > **注意：线程并不是越多越好。** 如果业务处理本身较轻，没必要额外引入线程池，否则会增加线程调度、上下文切换以及线程间通信的开销。因此，本项目不单独增加 Worker 线程池，而是直接在 **Reactor 线程中完成 IO 处理和业务处理**，在保证流程简单的同时减少额外的并发开销。
 
 ### 1.3 功能模块
-
 
 #### One Thread One Loop
 
@@ -130,92 +129,90 @@ Buffer模块是一个缓冲区模块，用于实现通信中用户态的接收�
 Buffer 的作用主要有 4 个：
 
 1. **解决半包、粘包**
+
    - 一次 `read()` 可能只读到半个请求
    - 也可能一次读到多个请求
    - Buffer 把零散数据先攒起来，等拼完整再交给上层
-
 2. **把网络 I/O 和业务处理解耦**
+
    - 读事件来了，不代表业务马上就能处理
    - 先进入 Buffer，后面再按协议解析成 HTTP 请求、消息包之类的内容
-
 3. **支持写缓冲**
+
    - `write()` 也不一定一次写完
    - Buffer 可以把没写完的数据先存住，等下次可写事件再继续发
-
 4. **提高效率**
+
    - 避免频繁小内存分配
    - 减少 `read/write` 的零碎操作
    - 更适合高并发服务器
-
-
 
 #### Socket模块
 
 负责完成对底层套接字接口的封装，主要有这几个作用：
 
 1. **封装系统接口**
+
    - 像 `socket / bind / listen / accept / connect / shutdown` 这些都很底层
    - 单独封装后，上层不用直接碰一堆系统调用
-
 2. **统一管理 fd**
+
    - socket 本质上就是一个文件描述符
    - 模块化以后，创建、关闭、复用、设置属性都更清楚
-
 3. **设置连接参数**
+
    - 比如地址复用、Nagle 相关选项、保持连接、非阻塞等
    - 这些都是服务器必须处理的底层细节
-
 4. **给上层模块提供稳定接口**
+
    - `Acceptor` 需要监听 socket
    - `Connection` 需要读写 socket
    - 上层只关心“怎么用”，不关心底层系统细节
-
 
 #### Channel模块
 
 Channel模块是对一个描述符需要进行的IO事件管理的模块，实现对描述符可读，可写，错误事件的管理操作，以及Poller模块对描述符进行IO事件监控就绪后，根据不同的事件，回调不同的处理函数功能。下面是主要功能：
 
 1. **绑定一个 fd**
+
    - 比如 socket、listen fd、连接 fd
    - 一个 fd 通常对应一个 Channel
-
 2. **记录这个 fd 关心什么事件**
+
    - 可读
    - 可写
    - 关闭
    - 错误
-
 3. **保存事件回调**
+
    - 读事件来了，调用读回调
    - 写事件来了，调用写回调
    - 出错或关闭时，也走对应回调
-
-
 
 #### Connection模块
 
 Connection模块是对Buffer模块，Socket模块，Channel模块的一个整体封装，实现了对一个通信套接字的整体的管理，进行数据通信的套接字使用Connection进行管理。下面是该模块包含的内容：
 
 - 组件使用者可以传入的回调函数：连接建立完成回调，事件进行时回调，新数据回调，关闭回调。
-
 - 两个组件使用者提供的接口：数据发送接口，连接关闭接口
 - 两个用户态缓冲区：用户态接收缓冲区，用户态发送缓冲区
 - 一个Socket对象：完成描述符面向系统的IO操作
 - 一个Channel对象：完成描述符IO事件就绪的处理
 
-
 简单一点理解作用：
+
 1. **管理一条连接**
+
    - 每个 `accept` 到的新连接，都会交给一个 `Connection` 管，它代表“客户端和服务端之间这一次会话”
-
 2. **把底层模块串起来**
-   - 里面有 `Socket`、 `Channel`、两个 `Buffer`，所以它是 `Buffer + Socket + Channel` 的整体封装
 
+   - 里面有 `Socket`、 `Channel`、两个 `Buffer`，所以它是 `Buffer + Socket + Channel` 的整体封装
 3. **负责读写流程**
+
    - 读数据：socket 收到字节流，先放进接收缓冲区
    - 写数据：业务层把数据放进发送缓冲区，再由 socket 发出去
-
 4. **负责连接状态和关闭**
+
    - 连接建立
    - 收到新数据
    - 数据发送完成
@@ -229,8 +226,6 @@ Connection模块是对Buffer模块，Socket模块，Channel模块的一个整体
 2. 当描述符在Poller模块中就绪了IO可读事件，则调用描述符对应Channel中保存的读事件处理函数，进行数据读取，将socket接收缓冲区全部读取到Connection管理的用户态接收缓冲区中。然后调用由组件使用者传入的新数据到来回调函数进行处理。
 3. 组件使用者进行数据的业务处理完毕后，通过Connection向使用者提供的数据发送接口，将数据写入Connection的发送缓冲区中。
 4. 启动描述符在Poller模块中的IO写事件监控，就绪后，调用Channel中保存的写事件处理函数，将发送缓冲区中的数据通过Socket进行面向系统的实际数据发送。
-
-
 
 ```mermaid
 flowchart TB
@@ -277,10 +272,7 @@ flowchart TB
     API -. "发送数据进入 Buffer" .-> B
 ```
 
-
-
 #### Acceptor模块
-
 
 Acceptor模块是对Socket模块，Channel模块的一个整体封装，实现了对一个监听套接字的整体的管理。其内部包含有：
 
@@ -292,8 +284,8 @@ Acceptor模块是对Socket模块，Channel模块的一个整体封装，实现�
 1. 实现向Channel提供可读事件的IO事件处理回调函数，函数的功能其实也就是获取新连接
 2. 为新连接构建一个Connection对象出来：监听 socket 可读 -> Acceptor 调用 accept() -> 得到新 fd -> 创建 Connection
 
-
 注意这里的channel要和Connection中的channel区别开来：
+
 1. `Acceptor` 里的 `Channel`它监听的是**监听 socket**。
 
 - 这个 socket 先 `listen()`
@@ -313,6 +305,7 @@ Acceptor模块是对Socket模块，Channel模块的一个整体封装，实现�
 **`Connection` 中的 `Channel` 负责后续读写和关闭等回调。**
 
 #### TimerQueue模块
+
 TimerQueue模块是实现固定时间定时任务的模块，向定时任务管理器中添加一个任务，任务将在固定时间后被执行，同时也可以重新设置定时任务来延迟任务的执行。
 
 这个模块对Connection对象的生命周期管理，对非活跃连接进行超时后的释放，其中包含有：
@@ -321,18 +314,20 @@ TimerQueue模块是实现固定时间定时任务的模块，向定时任务管�
 - 一个Channel对象：实现对timerfd的IO时间就绪回调处理
 
 #### Poller模块：
+
 Poller模块是对epoll进行封装的一个模块，实现epoll的IO事件添加，修改，移除，获取活跃连接功能，主要有以下功能：
 
 1. **注册 fd 到事件监控里**
+
    - 把 `Channel` 关心的事件交给底层系统，比如读事件、写事件
-
 2. **修改监听事件**
+
    - 某个连接现在不想监听写了，就把写事件去掉，某个 fd 状态变了，就更新监控内容
-
 3. **删除 fd 监听**
-   - 连接关闭后，从事件集合里移除
 
+   - 连接关闭后，从事件集合里移除
 4. **等待就绪事件**
+
    - 调用 `epoll_wait` 之类的接口阻塞等待，一旦有事件发生，把“活跃的 Channel”返回给上层，接下来就是调用对应的回调函数。
 
 #### EventLoop模块
@@ -372,6 +367,7 @@ EventLoop 包含：
             ├── Connection 2（fd2）
             └── Connection 3（fd3）
 ```
+
 具体操作流程：
 
 1. 通过Poller模块对当前模块管理内的所有描述符进行IO事件监控，有描述符事件就绪后，通过描述符对应的Channel进行事件处理。
@@ -379,37 +375,32 @@ EventLoop 包含：
 3. 由于epoll的事件监控，有可能会因为没有事件到来而持续阻塞，导致任务队列中的任务不能及时得到执行，因此创建了eventfd，添加到Poller的事件监控中，用于实现每次**向任务队列添加任务的时候，通过向eventfd写入数据来唤醒epoll的阻塞。**
 
 #### TcpServer模块：
+
 主要工作在主Reactor中，内部封装了Acceptor模块，EventLoopThreadPool模块。包含以下：
 
 - 一个EventLoop对象：以备在超轻量使用场景中不需要EventLoop线程池，只需要在主线程中完成所有操作的情况。
 - 一个EventLoopThreadPool对象：EventLoop线程池（子Reactor线程池）
 - 一个Acceptor对象：一个TcpServer服务器，必然对应有一个监听套接字，能够完成获取客户端新连接，并处理的任务。
-
 - TcpServer模块内部包含有一个`std::shared_ptr<Connection>`的hash表：保存了所有的新建连接对应的Connection，注意，所有的Connection使用shared_ptr进行管理，这样能够保证在hash表中删除了Connection信息后，在shared_ptr计数器为0的情况下完成对Connection资源的释放操作。
 
 主要功能有：
 
 1. **监听连接的管理**
-负责客户端新连接的接入处理，获取新连接之后的处理逻辑由TcpServer模块统一设置，完成新连接的接收、初始化与分配。
-
+   负责客户端新连接的接入处理，获取新连接之后的处理逻辑由TcpServer模块统一设置，完成新连接的接收、初始化与分配。
 2. **通信连接的管理**
-管控所有已建立通信的连接，连接产生的各类IO事件（读事件、写事件等）的处理规则，由TcpServer模块统一配置。
-
+   管控所有已建立通信的连接，连接产生的各类IO事件（读事件、写事件等）的处理规则，由TcpServer模块统一配置。
 3. **超时连接的管理**
-负责连接的健康状态管理，连接非活跃超时后是否关闭、资源是否回收的策略，由TcpServer模块设置，避免非活跃连接占用服务器资源。
-
+   负责连接的健康状态管理，连接非活跃超时后是否关闭、资源是否回收的策略，由TcpServer模块设置，避免非活跃连接占用服务器资源。
 4. **事件监控的管理**
-负责底层事件循环的资源调度，服务器启动多少个线程、创建多少个EventLoop事件循环，都由TcpServer进行配置。
-
+   负责底层事件循环的资源调度，服务器启动多少个线程、创建多少个EventLoop事件循环，都由TcpServer进行配置。
 5. **事件回调函数的设置**
-事件处理回调由使用者配置给TcpServer，再由TcpServer下发给每一个Connection连接。
+   事件处理回调由使用者配置给TcpServer，再由TcpServer下发给每一个Connection连接。
 
 具体操作流程如下：
 
 1. 在实例化TcpServer对象过程中，完成BaseLoop的设置，Acceptor对象的实例化，以及EventLoop线程池的实例化，以及`std::shared_ptr<Connection>`的hash表的实例化。
 2. 为Acceptor对象设置回调函数：获取到新连接后，为新连接构建Connection对象，设置Connection的各项回调，并使用shared_ptr进行管理，并添加到hash表中进行管理，并为Connection选择一个EventLoop线程，为Connection添加一个定时销毁任务，为Connection添加事件监控，
 3. 启动BaseLoop。
-
 
 #### HTTP协议模块
 
@@ -430,7 +421,6 @@ HTTP协议模块用于对高并发服务器模块进行协议支持，基于提�
   - 判断一个文件是否是目录
   - 判断一个文件是否是普通文件
   - HTTP资源路径的有效性判断
-
 
 #### HttpRequest模块
 
@@ -495,7 +485,6 @@ std::smatch _matches;     // 正则路由匹配结果
 5. 根据 `Connection` 和 HTTP 版本判断是否保持长连接。
 6. 保存正则路由匹配结果，方便获取路径参数。
 
-
 #### HttpResponse模块
 
 这个模块是HTTP响应数据模块，用于业务处理后设置并保存HTTP响应数据的各项元素信息，最终会被按照HTTP协议响应格式组织成为响应信息发送给客户端。
@@ -513,25 +502,18 @@ std::smatch _matches;     // 正则路由匹配结果
 
 - `ReSet()`
   重置当前 HTTP 响应对象，恢复默认状态。
-
 - `SetHeader()`
   设置或修改指定的 HTTP 响应头字段。
-
 - `HasHeader()`
   判断指定响应头是否存在。
-
 - `GetHeader()`
   获取指定响应头对应的值。
-
 - `SetContent()`
   设置响应正文，同时设置正文类型 `Content-Type`。
-
 - `SetRedirect()`
   设置重定向地址，并指定重定向状态码，默认使用 `302`。
-
 - `Close()`
   根据 `Connection` 响应头判断响应完成后是否需要关闭 TCP 连接。
-
 - `_statu`：保存 HTTP 响应状态码，默认 `200`。
 - `_redirect_flag`：标记当前响应是否为重定向响应。
 - `_version`：保存 HTTP 协议版本。
@@ -539,11 +521,10 @@ std::smatch _matches;     // 正则路由匹配结果
 - `_redirect_url`：保存重定向目标地址。
 - `_headers`：使用哈希表保存 HTTP 响应头，便于快速增删查改。
 
-
-
 #### HttpContext模块
 
 这个模块是一个HTTP请求接收的上下文模块，主要是为了防止在一次接收的数据中，不是一个完整的HTTP请求，则解析过程并未完成，无法进行完整的请求处理，需要在下次接收到新数据后继续根据上下文进行解析，最终得到一个HttpRequest请求信息对象，因此在请求数据的接收以及解析部分需要一个上下文来进行控制接收和处理节奏。
+
 - 功能：
 
   - 记录当前 HTTP 请求的**接收和解析进度**，支持请求数据分多次到达。
@@ -557,10 +538,7 @@ std::smatch _matches;     // 正则路由匹配结果
   - 记录请求处理过程中产生的 HTTP 响应状态码。
   - 为下一次收到数据后继续解析提供上下文。
 
-
-
 #### HttpServer模块
-
 
 1. HttpServer 模块功能
 
@@ -571,80 +549,79 @@ std::smatch _matches;     // 正则路由匹配结果
 - 执行业务处理函数，由业务层填写状态码、响应头、响应正文等内容。
 - 最终将 `HttpResponse` 组织成 HTTP 响应数据并发送给客户端。
 
-
-
 2. HttpServer 核心要素
 
 - **请求路由表**
+
   - GET 请求路由表
   - POST 请求路由表
   - PUT 请求路由表
   - DELETE 请求路由表
   - 每张路由表保存“请求路径 → 处理函数”的映射关系。
-
 - **请求与响应对象**
+
   - `HttpRequest`：保存请求方法、URL、请求头、请求正文等请求信息。
   - `HttpResponse`：保存状态码、响应头、响应正文等返回信息。
-
 - **业务处理函数**
+
   - 用户提前注册 HTTP 请求对应的回调函数。
   - HttpServer 匹配到对应路由后，只负责调用该函数，不直接处理具体业务。
-
 - **静态资源根目录**
+
   - 用于保存 HTML、CSS、JS、图片等静态文件。
   - 当请求属于静态资源时，根据请求路径定位实际文件并返回。
-
 - **TCPServer**
+
   - 负责底层 Socket、连接管理、事件监听以及网络数据收发。
   - HttpServer 在其基础上增加 HTTP 协议层功能。
 
 3. HttpServer 主要接口
 
 - **路由注册接口**
+
   - 提供 `GET`、`POST`、`PUT`、`DELETE` 等请求的注册接口。
   - 将请求路径和用户提供的处理函数保存到对应路由表中。
   - 后续收到功能性请求时，根据“请求方法 + 请求路径”查找对应处理函数。
-
 - **静态资源设置接口**
+
   - 设置服务器的静态资源根目录。
   - 后续收到静态资源请求时，根据根目录和请求路径查找对应文件。
   - 读取文件内容并填充到 `HttpResponse` 中。
-
 - **超时连接管理接口**
+
   - 设置是否开启连接超时关闭功能。
   - 对长时间没有数据交互的空闲连接进行自动关闭。
   - 避免无效连接长期占用服务器资源。
-
 - **线程数量设置接口**
+
   - 设置底层 `TCPServer` 线程池中的线程数量。
   - 用于控制服务器处理连接和网络事件的并发能力。
-
 - **服务器启动接口**
+
   - 启动底层 `TCPServer`。
   - 开始监听客户端连接，并进入事件循环处理网络请求。
-
 - **`OnConnected` 连接处理接口**
+
   - 在新的 TCP 连接建立后被调用。
   - 为当前连接设置对应的 HTTP 协议上下文 `HttpContext`。
   - 用于保存该连接当前 HTTP 请求的解析状态。
-
 - **`OnMessage` 请求处理接口**
+
   - 从接收缓冲区读取客户端发送的数据。
   - 利用 `HttpContext` 对 HTTP 数据进行解析。
   - 解析完整请求后生成 `HttpRequest`。
   - 进入后续的请求查找和响应处理流程。
-
 - **请求路由查找接口**
+
   - 根据请求路径和请求方法判断具体处理方式。
   - 静态资源请求：查找对应文件并返回文件数据。
   - 功能性请求：在对应路由表中查找处理函数并执行。
   - 如果没有找到对应资源或路由，则生成相应的错误响应。
-
 - **响应发送接口**
+
   - 将处理结果封装成 `HttpResponse`。
   - 根据状态码、响应头和响应正文组织完整的 HTTP 响应报文。
   - 最终通过底层连接对象发送给客户端。
-
 
 项目总体模块架构：
 
@@ -688,20 +665,16 @@ int timerfd_create(int clockid, int flags);
   - 指定定时器使用的时钟类型。
   - `CLOCK_MONOTONIC`：单调时钟，不受系统时间修改影响，常用于超时定时（推荐使用）。
   - `CLOCK_REALTIME`：系统实时时钟，会受系统时间修改影响。
-
 - `flags`
 
   - 指定文件描述符属性。
   - `TFD_CLOEXEC`：执行 `exec()` 时自动关闭文件描述符。
   - `TFD_NONBLOCK`：设置为非阻塞模式。
   - 多个标志可以使用 `|` 组合。
-
 - 返回值
 
   - 成功：返回定时器文件描述符。
   - 失败：返回 `-1`，并设置 `errno`。
-
-
 
 #### `timerfd_settime`
 
@@ -727,23 +700,24 @@ struct itimerspec {
 ```
 
 - `fd`
-  - `timerfd_create()` 返回的定时器文件描述符。
 
+  - `timerfd_create()` 返回的定时器文件描述符。
 - `flags`
+
   - `0`：`new_value->it_value` 表示相对时间，例如“5 秒后触发”。
   - `TFD_TIMER_ABSTIME`：表示绝对时间，例如“在某个指定时间点触发”。
   - `TFD_TIMER_CANCEL_ON_SET`：系统时间发生变化时取消定时器，通常与 `TFD_TIMER_ABSTIME` 一起使用。
-
 - `new_value`
+
   - 指向新的定时器设置。
   - `it_value`：首次触发时间。
   - `it_interval`：重复触发的时间间隔，为 `0` 表示一次性定时器。
-
 - `old_value`
+
   - 用于保存设置前的定时器配置。
   - 不需要获取旧配置时，可以传入 `NULL`。
-
 - 返回值
+
   - 成功：返回 `0`。
   - 失败：返回 `-1`，并设置 `errno`。
 
@@ -755,7 +729,6 @@ struct itimerspec {
 
 管理非活跃的销毁任务时，将定时任务封装到类中，示例化时添加定时任务，并用`share_ptr`进行管理，当时间到达时，触发销毁逻辑（share_ptr--），如果引用计数归零，则真正执行析构，**非活跃任务->活跃任务时用老的类创建一个新的类，产生新的定时任务，shared_ptr++，这样老的定时任务执行时不会析构已经激活的连接。**
 
-
 > `shared_ptr` 应该用 `std::make_shared<T>()` 或由已有的 `shared_ptr` 拷贝/移动来创建，**不要用同一个裸指针反复构造多个独立的 `shared_ptr`**，否则会导致重复释放。项目使用`weak_ptr`来获得`shared_ptr`，进行新的定时任务的创建，同时也不会增加引用计数，避免重复释放。
 
 ```plain
@@ -763,7 +736,9 @@ struct itimerspec {
 连接对象 ──────┤                          ├→ 同一个连接对象
               └── 定时任务2 ── shared_ptr ┘
 ```
+
 时间轮结构图：
+
 ```mermaid
 flowchart LR
     T[定时任务] --> H
@@ -786,6 +761,7 @@ flowchart LR
 ```
 
 时间轮设计参考`timewheel.hpp`:
+
 ```cpp
 #include "timewheel.hpp"
 ```
@@ -793,7 +769,6 @@ flowchart LR
 ### 1.6 正则表达式
 
 正则表达式是一种用于匹配字符串的模式，常用于文本处理和数据提取。`std::regex` 是 C++ 标准库提供的**正则表达式工具**，用于按照规则对字符串进行**匹配、查找、提取和替换**。
-
 
 ```cpp
 #include <regex>
@@ -803,18 +778,16 @@ std::regex pattern(R"(\d+)"); //R"()" 是 C++ 的原始字符串
 
 常见规则：
 
-| 正则       | 含义         |
-| -------- | ---------- |
+| 正则       | 含义           |
+| ---------- | -------------- |
 | `\d`     | 一个数字       |
-| `\d+`    | 一个或多个数字    |
-| `\d*`    | 0 个或多个数字   |
-| `[a-z]`  | 一个小写字母     |
-| `[0-9]+` | 一个或多个数字    |
-| `^abc`   | 以 `abc` 开头 |
-| `abc$`   | 以 `abc` 结尾 |
-| `.*`     | 任意字符若干个    |
-
-
+| `\d+`    | 一个或多个数字 |
+| `\d*`    | 0 个或多个数字 |
+| `[a-z]`  | 一个小写字母   |
+| `[0-9]+` | 一个或多个数字 |
+| `^abc`   | 以`abc` 开头 |
+| `abc$`   | 以`abc` 结尾 |
+| `.*`     | 任意字符若干个 |
 
 #### regex_match/regex_search
 
@@ -838,18 +811,17 @@ std::regex pattern(
 ```
 
 1. `(` `GET|HEAD|POST|PUT|DELETE` `)`：表示第 **1 个捕获组**，匹配 `GET`、`HEAD`、`POST`、`PUT`、`DELETE` 中任意一个 HTTP 方法，其中 `|` 表示“或”、`()` 表示捕获匹配内容；注意这里只允许这 5 种方法，其他方法如 `PATCH`、`OPTIONS` 不匹配。
-2. ` `：表示一个**普通空格字符**；用于分隔 HTTP 方法和后面的请求目标，例如 `GET / HTTP/1.1` 中 `GET` 后面的空格；注意这里要求当前位置确实存在一个空格。
+2. ：表示一个**普通空格字符**；用于分隔 HTTP 方法和后面的请求目标，例如 `GET / HTTP/1.1` 中 `GET` 后面的空格；注意这里要求当前位置确实存在一个空格。
 3. `(` `[^?\\s]*` `)`：表示第 **2 个捕获组**，用于匹配请求路径；其中 `[]` 表示字符集合、开头的 `^` 表示集合取反，因此 `[^?\\s]` 表示匹配既不是 `?`、也不是空白字符的字符，`*` 表示重复 0 次或多次。例如 `/index.html`、`/user/login` 都可以被匹配；这里额外排除了空格，避免在没有 `?` 时把后面的 ` HTTP/1.1` 一起吃进去。
 4. `(?: ... )`：表示一个**非捕获组**，用于把内部的 `\\?([^\\s]*)` 看成一个整体，但不会产生新的 `match[n]`；这样后面的捕获组编号不会因为这个括号而增加。
 5. `\\?`：C++ 字符串中的 `\\` 会变成正则中的 `\`，因此实际正则是 `\?`，表示匹配一个**字面量问号 `?`**；如果直接写正则中的 `?`，它通常表示“前一个规则出现 0 次或 1 次”，所以这里需要转义。
 6. `(` `[^\\s]*` `)`：表示第 **3 个捕获组**，用于匹配 `?` 后面的查询参数；其中 `[^\\s]` 表示匹配非空白字符，`*` 表示重复 0 次或多次，因此类似 `id=10&name=tom` 的查询参数都会被匹配。
 7. `(?:\\?([^\\s]*))?`：表示整个 **`?查询参数` 部分是可选的**，最后的 `?` 表示前面的整个非捕获组出现 0 次或 1 次；因此 `GET / HTTP/1.1` 和 `GET /user?id=10 HTTP/1.1` 都可以正常匹配。
-8. ` `：表示一个普通空格，用来分隔前面的请求路径或查询参数和后面的 HTTP 版本；这个空格本身也是正则匹配条件的一部分。
+8. ：表示一个普通空格，用来分隔前面的请求路径或查询参数和后面的 HTTP 版本；这个空格本身也是正则匹配条件的一部分。
 9. `(` `HTTP/1\\.[01]` `)`：表示第 **4 个捕获组**，匹配 `HTTP/1.0` 或 `HTTP/1.1`；其中 `\\.` 在 C++ 字符串中最终变成正则的 `\.`，表示匹配字面量句点 `.`，`[01]` 表示匹配字符 `0` 或 `1`。
 10. `\r\n`：表示 HTTP 请求行结尾的 **CRLF**，其中 `\r` 表示回车符 CR，`\n` 表示换行符 LF；例如 `GET / HTTP/1.1\r\n`，这个 `\r\n` 用于标志请求行结束，后面开始进入 HTTP Header。
 11. `(` `[\\s\\S]*` `)`：表示第 **5 个捕获组**，用于匹配请求行后面的**所有剩余内容**；其中 `\\s` 表示空白字符，`\\S` 表示非空白字符，因此 `[\\s\\S]` 合起来就是“任意字符”，再配合 `*` 表示匹配 0 个或多个任意字符，可以跨越 `\r\n`，把后面的所有 HTTP Header，甚至 Body 一起保存到 `match[5]` 中。
 12. `[\\s\\S]*` 与普通的 `.*` 不同：`.` 默认通常不能匹配换行符，因此 `(.*)` 无法直接跨越多行 Header；而 `[\\s\\S]*` 同时包含空白字符和非空白字符，因此能够匹配包括 `\r`、`\n` 在内的所有内容。
-
 
 表示先解析 HTTP 请求行中的**请求方法、请求路径、可选查询参数、HTTP 版本**，再通过 `\r\n` 区分请求行和后面的内容，并把后面的所有 HTTP Header / Body 整体保存到第 **5 个捕获组**中。
 
@@ -875,7 +847,6 @@ match[5] // Host: localhost\r\nConnection: keep-alive\r\n
 ### 1.7 Any类型
 
 在服务器中，`Connection` 类负责管理一条通用的 TCP 连接，但不同连接上层可能运行不同的应用层协议，例如 HTTP、WebSocket 或 RPC，而不同协议又需要保存各自不同的解析状态信息。例如 HTTP 需要保存当前解析到请求行、请求头还是请求体，以及已经解析出的 `HttpRequest`，这些信息可以封装在 `HttpContext` 中；WebSocket 则可能需要保存握手状态和数据帧解析状态，因此它的上下文类型又完全不同。如果直接在 `Connection` 中定义 `HttpContext` 成员，那么 `Connection` 就会和 HTTP 协议强耦合，无法方便地复用于其他协议。为了解决这个问题，可以在 `Connection` 中使用 `std::any` 或自定义的 `Any` 类型保存协议上下文。`any` 本身并不负责协议解析，它只是一个可以存放任意类型对象的通用容器：当连接用于 HTTP 时，其中保存 `HttpContext`；用于 WebSocket 时，则保存 `WebSocketContext`。这样 `Connection` 只负责连接管理和上下文存储，而具体协议模块负责定义和解释自己的上下文数据，从而实现网络连接层与应用层协议之间的解耦。
-
 
 `Any` 类型的设计目标是让同一个变量能够保存任意类型的数据，其核心思想是 **类型擦除（Type Erasure）**。所谓类型擦除，并不是把真实的数据类型删除，而是把不同的具体类型统一隐藏在一个公共的基类接口之后。在这个设计中，首先定义抽象基类 `holder`，用于提供所有数据包装对象都必须具备的统一接口；然后定义模板子类 `placeholder<T>` 继承 `holder`，由它真正保存具体的 `T` 类型数据，例如 `int`、`string`、`HttpContext` 等。`Any` 自身并不直接保存这些具体类型，而只维护一个 `holder* _content` 指针。这样，当存入 `int` 时，内部实际创建的是 `placeholder<int>`；存入 `string` 时，创建的是 `placeholder<string>`，但对于 `Any` 来说，它们都可以统一通过 `holder*` 进行管理。真实类型仍然保存在 `placeholder<T>` 内部，而 `Any` 本身无需知道具体类型是什么，这就实现了“内部保留具体类型、外部隐藏具体类型”的类型擦除。
 
@@ -905,6 +876,7 @@ Any b = std::string("hello"); // 内部实际保存 placeholder<string>
 ```
 
 不想实现也可以直接使用`#include <any>`中库函数，注意cmakelist中要设置为C++17标准，否则会编译失败，使用示例：
+
 ```cpp
 #include <any>
 #include <iostream>
@@ -945,7 +917,9 @@ std::any b = std::make_any<Context>(3); // 创建并初始化一个 any
 `std::any` 的核心作用是通过类型擦除保存任意可复制类型；读取时使用 `std::any_cast<T>` 恢复真实类型。工程中推荐优先使用指针形式 `std::any_cast<T>(&a)`，因为类型不匹配时只返回 `nullptr`，不会抛异常。
 
 ## 2.模块开发
+
 ### 2.1 Buffer模块
+
 - 提供的功能有：存储数据以及取出数据；
 - 实现思想：
   - 1.实现缓冲区需要内存空间，采用`vector<char>`数据结构，不用`string`是为了避免受到`\0`的影响；
@@ -969,6 +943,7 @@ std::any b = std::make_any<Context>(3); // 创建并初始化一个 any
   - 写入string并push；
 
 ### 2.2 socket模块
+
 - 提供的功能有：封装套接字操作；
 - 实现思想：
   - 1.封装套接字的创建、绑定、监听、连接、关闭等操作；
@@ -986,23 +961,26 @@ std::any b = std::make_any<Context>(3); // 创建并初始化一个 any
   - 创建客户端连接；
 
 ### 2.3 channel模块
+
 - 提供的功能有：管理 fd 事件和回调；
 - 实现思想：
+
   - 1.封装对描述符的事件管理，记录描述符关心的事件类型，如可读、可写、关闭、错误等；
   - 2.保存描述符的事件回调函数，当事件就绪时调用对应的回调函数进行处理；
 - 包含方法：
-   - 设置可读事件回调；
-   - 设置可写事件回调；
-   - 设置关闭事件回调；
-   - 设置错误事件回调；
-   - 设置任意事件回调；
-   - 获取描述符；
-   - 获取关心的事件类型；
-   - 更新事件类型；
-   - 移除事件类型;
-   - 使用epoll对管理的描述符进行事件监控；
 
+  - 设置可读事件回调；
+  - 设置可写事件回调；
+  - 设置关闭事件回调；
+  - 设置错误事件回调；
+  - 设置任意事件回调；
+  - 获取描述符；
+  - 获取关心的事件类型；
+  - 更新事件类型；
+  - 移除事件类型;
+  - 使用epoll对管理的描述符进行事件监控；
 - epoll可以监听的事件：
+
 * `EPOLLIN`：表示 fd 当前可读，可以执行 `recv()` 或监听 fd 的 `accept()`。
 * `EPOLLOUT`：表示 fd 当前可写，可以继续执行 `send()`。
 * `EPOLLRDHUP`：表示对端关闭了连接或关闭了写方向。
@@ -1011,6 +989,7 @@ std::any b = std::make_any<Context>(3); // 创建并初始化一个 any
 * `EPOLLHUP`：表示连接已经挂断，通常需要关闭并清理 fd。
 
 ### 2.4 poller模块
+
 - 提供的功能有：通过epoll来监控fd的IO事件；
 - 实现思想：`Poller` 是对 `epoll` 的封装，负责：
   - 添加/修改 fd 的事件监控
@@ -1025,6 +1004,7 @@ int _epoll_fd;                         // epoll 操作句柄
 std::vector<epoll_event> _events;      // 保存 epoll_wait 返回的就绪事件
 std::unordered_map<int, Channel*> _channels; // fd -> Channel
 ```
+
 ```mermaid
 flowchart LR
     A[Channel 设置 _events]
@@ -1065,6 +1045,7 @@ ev.data.ptr = channel; //也可以直接保存对象指针
 ```cpp
 int epfd = epoll_create1(0); //返回一个 epoll 文件描述符：
 ```
+
 - 添加 / 修改 / 删除监听
 
 ```cpp
@@ -1074,7 +1055,6 @@ epoll_ctl(epfd, operation, fd, &event);
 // EPOLL_CTL_MOD   // 修改
 // EPOLL_CTL_DEL   // 删除
 ```
-
 
 - 等待事件
 
@@ -1092,8 +1072,8 @@ for (int i = 0; i < n; i++)
     uint32_t revents = events[i].events;
 }
 ```
-### 2.5 eventLoop模块
 
+### 2.5 eventLoop模块
 
 `eventfd` 是 Linux 提供的一种**事件通知机制**，本质上是在内核中维护一个 `uint64_t` 计数器，并返回一个文件描述符。
 
@@ -1102,7 +1082,6 @@ for (int i = 0; i < n; i++)
 - eventfd 是文件描述符，因此可以被 `epoll` 监听。
 
 eventfd 的作用是：**当 EventLoop 把耗时任务交给其他工作线程后又阻塞在 `epoll_wait()` 中时，工作线程完成任务会通过写入 eventfd 制造一个可读事件，从而唤醒 EventLoop，让它及时处理工作线程返回的结果或其他待执行任务。**
-
 
 ```cpp
 #include <sys/eventfd.h>  // eventfd、EFD_NONBLOCK、EFD_CLOEXEC
@@ -1130,6 +1109,7 @@ close(fd);
 ```
 
 模块大致流程如下：
+
 ```mermaid
 flowchart TD
     A["EventLoop::StartEventLoop"] --> B["Poller::Poll / epoll_wait"]
@@ -1166,7 +1146,6 @@ flowchart TD
   - `Channel`：负责监听 fd 的 IO 事件
   - `Buffer`：负责保存接收数据和待发送数据
   - `EventLoop`：负责在所属线程中处理连接事件
-
 - 功能设计：
 
 1. 通过 `std::any` 保存协议上下文，支持不同协议的解析和处理。
@@ -1182,6 +1161,7 @@ flowchart TD
    - 任意时间处理回调
 
 Connection模块大致流程如下：
+
 ```mermaid
 flowchart TD
     A[Server accept 得到 fd] --> B[创建 Connection]
@@ -1211,6 +1191,7 @@ flowchart TD
 ```
 
 ### 2.7 Acceptor模块
+
 - 功能：对监听套接字进行管理
 - 涉及：
   1. 创建监听套接字；
@@ -1231,12 +1212,12 @@ flowchart TD
 3. **获取 Loop**：`GetLoop()` 加锁读取 `_loop`，供其他线程投递任务；循环结束后返回 `nullptr`。
 4. **回收线程**：析构函数请求停止 Loop，释放锁后调用 `join()` 等待子线程退出。Loop 随子线程中的局部对象销毁。
 
-| 成员 | 作用 |
-| --- | --- |
-| `_thread` | 承载事件循环的工作线程 |
-| `_loop` | 指向子线程中的 EventLoop，不拥有对象 |
-| `_mutex` | 保护 `_loop` 的跨线程读写；只读也须防止另一个线程同时写 |
-| `_cond` | 让构造函数等待 Loop 发布；等待时释放锁，被唤醒后重新加锁检查条件 |
+| 成员        | 作用                                                             |
+| ----------- | ---------------------------------------------------------------- |
+| `_thread` | 承载事件循环的工作线程                                           |
+| `_loop`   | 指向子线程中的 EventLoop，不拥有对象                             |
+| `_mutex`  | 保护`_loop` 的跨线程读写；只读也须防止另一个线程同时写         |
+| `_cond`   | 让构造函数等待 Loop 发布；等待时释放锁，被唤醒后重新加锁检查条件 |
 
 在主从 Reactor 模型中，主 Reactor 接收新连接，子 Reactor 处理连接的后续读写。两者都有 `EventLoop + Poller + Channel`，职责由各自注册的 fd 和回调决定。当前联合测试包含一个主 Reactor、一个子 Reactor。
 
@@ -1290,32 +1271,30 @@ flowchart TB
     C <-->|"连接建立后的业务数据"| CON
 ```
 
-
 `LoopThread` 则负责创建线程，让这个线程拥有并运行自己的 `EventLoop`。
 
-| 模型 | 接收连接 | 连接读写 | 业务处理 |
-|---|---|---|---|
-| 单 Reactor 单线程 | 同一个线程 | 同一个线程 | 同一个线程 |
-| 单 Reactor 多线程 | 一个 Reactor 线程 | 同一个 Reactor 线程 | 通常交给业务线程池 |
+| 模型                          | 接收连接                  | 连接读写                    | 业务处理                        |
+| ----------------------------- | ------------------------- | --------------------------- | ------------------------------- |
+| 单 Reactor 单线程             | 同一个线程                | 同一个线程                  | 同一个线程                      |
+| 单 Reactor 多线程             | 一个 Reactor 线程         | 同一个 Reactor 线程         | 通常交给业务线程池              |
 | **主从 Reactor 多线程** | **主 Reactor 线程** | **各子 Reactor 线程** | 当前代码在所属子 Reactor 中执行 |
-
 
 **一个子 Reactor 可以管理很多条连接，并不是一条连接创建一个线程。** 当前 `Server` 文件还是空的，线程池和完整服务端封装尚未实现。
 
 **再看各模块：它们各负责哪一步**
 
-| 模块 | 职责 |
-|---|---|
-| `Socket` | 封装创建、监听、accept、recv、send、关闭 |
-| `Acceptor` | 管理监听 socket，接收新连接，把新 fd 交出去 |
-| `Connection` | 管理一条已建立连接的状态、收发和关闭 |
-| `Channel` | 记录一个 fd 关心哪些事件，以及事件发生后调用什么回调 |
-| `Poller` | 用 epoll 等待事件，找出哪些 Channel 就绪 |
-| `EventLoop` | 不断调用 Poller、分发事件、执行排队任务 |
-| `LoopThread` | 创建线程，在该线程中构造并运行 EventLoop |
-| `Buffer` | 保存收到的数据、等待发送的数据 |
-| `Any` | 保存每条连接的协议上下文，例如尚未收完整的消息 |
-| `TimeWheel` | 管理定时任务，例如关闭长期没有活动的连接 |
+| 模块           | 职责                                                 |
+| -------------- | ---------------------------------------------------- |
+| `Socket`     | 封装创建、监听、accept、recv、send、关闭             |
+| `Acceptor`   | 管理监听 socket，接收新连接，把新 fd 交出去          |
+| `Connection` | 管理一条已建立连接的状态、收发和关闭                 |
+| `Channel`    | 记录一个 fd 关心哪些事件，以及事件发生后调用什么回调 |
+| `Poller`     | 用 epoll 等待事件，找出哪些 Channel 就绪             |
+| `EventLoop`  | 不断调用 Poller、分发事件、执行排队任务              |
+| `LoopThread` | 创建线程，在该线程中构造并运行 EventLoop             |
+| `Buffer`     | 保存收到的数据、等待发送的数据                       |
+| `Any`        | 保存每条连接的协议上下文，例如尚未收完整的消息       |
+| `TimeWheel`  | 管理定时任务，例如关闭长期没有活动的连接             |
 
 每个 Loop 内部反复做的是：
 
@@ -1376,13 +1355,11 @@ flowchart LR
 
 当前连接发生活动时会刷新空闲任务，正常关闭时会取消任务。**接收连接走主 Loop，连接收发和空闲超时走所属工作 Loop**
 
-
 ### 2.9 LoopThread线程池开发
 
 - 主要功能：管理工作线程，为新连接分配 EventLoop、**配置工作线程数量、管理 `LoopThread` 对象、为新连接选择所属的 `EventLoop`。**
 
 `LoopThread` 提供一个工作线程及其 EventLoop；`LoopThreadPool` 将多个 `LoopThread` 组织起来，让主 Reactor 能把连接分给不同的子 Reactor。
-
 
 **分配连接**
 
@@ -1401,7 +1378,6 @@ flowchart TD
 ```
 
 调用方获取 Loop 后，通过 `RunInLoop()` 或 `QueueInLoop()` 将连接初始化操作交给它执行。**线程池负责选择 Loop，连接的创建和回调设置由上层负责。**
-
 
 ## 3.模块整合
 
@@ -1446,7 +1422,6 @@ make webbench CFLAGS='-Wall -O2 -I/usr/include/tirpc'
 参考：[镜像 README](https://github.com/tamlok/webbench)、[源码](https://github.com/tamlok/webbench/blob/master/webbench.c)、[FreeBSD Webbench 说明](https://www.freshports.org/benchmarks/webbench/)。
 
 #### EchoServer中的回调关系
-
 
 1. **`EchoServer::EchoServer()`：把业务函数交给 `_server`。**
 
@@ -1494,13 +1469,13 @@ Channel::HandleEvent()
 
 先通过 `_pool.NextLoop()` 选择 Loop，再用 `loop->RunInLoop()` 在所属线程创建 `connection`，放入 `_conns[conn_id]`，然后设置：
 
-| 实际设置语句 | Connection 中保存的位置 |
-|---|---|
-| `connection->SetConnectedCallback(_connected_callback)` | `_connected_callback` |
-| `connection->SetMessageCallback(_message_callback)` | `_message_callback` |
-| `connection->SetCloseCallback(_close_callback)` | `_close_callback` |
-| `connection->SetAnyCallback(_any_callback)` | `_any_callback` |
-| `connection->SetServerCloseCallback(...)` | `_server_close_callback` |
+| 实际设置语句                                              | Connection 中保存的位置    |
+| --------------------------------------------------------- | -------------------------- |
+| `connection->SetConnectedCallback(_connected_callback)` | `_connected_callback`    |
+| `connection->SetMessageCallback(_message_callback)`     | `_message_callback`      |
+| `connection->SetCloseCallback(_close_callback)`         | `_close_callback`        |
+| `connection->SetAnyCallback(_any_callback)`             | `_any_callback`          |
+| `connection->SetServerCloseCallback(...)`               | `_server_close_callback` |
 
 最后一项绑定的是 `TcpServer::RemoveConnection(conn)`，用于服务器内部回收，和业务函数 `EchoServer::Onclosed()` 分开保存。
 
@@ -1508,13 +1483,13 @@ Channel::HandleEvent()
 
 `connection->Established()` 经 `_loop->RunInLoop()` 进入 `EstablishedInLoop()`，这里设置：
 
-| Channel 的 setter | 保存成员 | 最终调用 |
-|---|---|---|
-| `SetReadCallbck()` | `_read_callback` | `Connection::HandleRead()` |
+| Channel 的 setter     | 保存成员            | 最终调用                      |
+| --------------------- | ------------------- | ----------------------------- |
+| `SetReadCallbck()`  | `_read_callback`  | `Connection::HandleRead()`  |
 | `SetWriteCallbck()` | `_write_callback` | `Connection::HandleWrite()` |
 | `SetCloseCallbck()` | `_close_callback` | `Connection::HandleClose()` |
 | `SetErrorCallbck()` | `_error_callback` | `Connection::HandleClose()` |
-| `SetEventCallbck()` | `_event_callback` | `Connection::HandleAny()` |
+| `SetEventCallbck()` | `_event_callback` | `Connection::HandleAny()`   |
 
 这些 lambda 捕获 `weak`，先 `weak.lock()` 再调用函数。之后 `_channel->Update()` 注册读监听，并执行：
 
@@ -1575,3 +1550,26 @@ Channel::_event_callback()
 → 若设置了 _any_callback，再调用它
 ```
 
+## 4. 部署与测试
+
+### 测试环境与复现方法
+
+- 测试环境：Docker 容器 `ubuntu2404`，Ubuntu 24.04.4 LTS，Linux 7.0.14-linuxkit，aarch64 / ARM64。
+- Docker 虚拟机可见 18 个逻辑 CPU，约 15.6 GiB 内存；容器没有另设 CPU / 内存配额。
+- 编译工具：GCC / G++ 13.3.0、CMake 3.28.3；项目采用 C++17。
+- 自动测试服务使用 3 个工作线程、3 秒空闲超时；慢处理隔离用例使用 1 个工作线程、2 秒空闲超时。正式 `release/server` 使用 3 个工作线程、30 秒空闲超时。
+- 压测工具：仓库中的 Webbench 1.5，HTTP/1.1，Docker 内部 IPv4 回环网络。保留默认 DEBUG 日志等级，服务端日志输出重定向到 `/dev/null`。
+
+### 测试方法
+
+**超时连接：** 在 `testhttpserver()` 的 `finaltest` 中，将测试服务的空闲超时设为 3 秒，分别建立不发送数据的连接、只发送部分请求头的连接，以及声明 10 字节正文却只发送 1 字节的连接；客户端等待 EOF，并用 `std::chrono::steady_clock` 记录关闭耗时，允许时间轮的一秒刻度误差，要求耗时在 1.5～5 秒内。另用同一连接每隔 1.1 秒发送一次完整请求，确认有正常活动的连接会刷新空闲计时器；再向空闲超时为 2 秒的独立服务每隔 600 毫秒发送一个字节，检查不完整请求是否会在测试规定的最大连接时限内关闭，用于暴露“持续少量发送数据绕过空闲超时”的问题。
+
+**错误请求：** 直接通过 TCP socket 发送手工构造的 HTTP 字节，避免浏览器自动补齐或规范化请求。逐项发送缺失或重复 Host、非法请求行和请求头、非法或重复 Content-Length、Transfer-Encoding 与 Content-Length 冲突、错误 URL 编码、目录穿越，以及超过请求行、请求头和正文大小限制的请求；分别核对预期的 400、413、414、431 或 501 状态码，并检查响应完整且连接关闭。
+
+**处理超时：** 启动只有 1 个工作线程、空闲超时为 2 秒的独立测试服务，先请求一个会休眠 3.5 秒的测试处理函数，150 毫秒后从另一连接请求普通状态接口。客户端检查普通请求是否取得正确响应，并要求从慢请求开始计时到普通请求完成的总耗时小于 1 秒；这样可以直接判断耗时处理是否阻塞同一工作线程。当前的实现是普通请求会被阻塞甚至因空闲计时到期而关闭，后续计划改进和扩展这一功能，以实现并行执行。
+
+**多条请求：** 先在同一 TCP 连接上连续发送请求，检查 keep-alive 是否正确复用连接，再把 HEAD 和 GET 混合发送，按 Content-Length 解析响应并保留多读出的字节，确认 HEAD 不带正文且不会影响下一条响应。随后将带有不同编号的 100 条 GET 请求拼成一段数据一次发送，逐条核对响应数量、编号和顺序，最后一条要求关闭连接；另启动 16 个并发客户端，各执行 3 轮带不同标识的请求和网页下载，检查响应是否串线、遗漏或截断。
+
+**大文件传输：** 下载现有的 `release/wwwroot/performance.html`，将响应正文与磁盘文件逐字节比较，并让客户端先等待 400 毫秒再读取，检查慢速接收时的发送完整性。另由测试路由返回 2 MiB 的确定性二进制数据，逐字节核对包括零字节在内的内容；上传恰好 16 MiB 的正文后紧接一条 GET，核对正文长度和下一条请求，检查解析边界。最后将客户端接收缓冲区设为 1024 字节，连续发送 32 条请求、每条要求返回 2 MiB，但暂不读取响应，读取服务进程的 `/proc/<pid>/status` 比较 RSS 增长，要求低于测试设定的 32 MiB 预算，以检查发送队列是否缺少内存限制和背压。
+
+**性能压力：** 服务端和 Webbench 都运行在 Docker 的 `ubuntu2404` 容器内，通过 `127.0.0.1` 访问，使用 Webbench 1.5 的 `-2` 参数发送 HTTP/1.1 请求。自动测试依次使用 10、50、100 个客户端各压测 3 秒，其中前两组访问首页，最后一组访问较大的 `/performance.html`；此外对 `release/server` 的 `/api/status` 做了相同并发数、每组 30 秒的补充测试。记录成功数、失败数、每秒请求数和传输速率；Webbench 本身不验证 HTTP 状态码和正文，因此每组压测前后还需发送普通请求核对完整响应，不能仅凭吞吐量判断服务正确。

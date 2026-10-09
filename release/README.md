@@ -117,14 +117,14 @@ LD_LIBRARY_PATH=/absolute/path/to/release/lib ./example_shared
 
 入口通过 `SetStaticDir("./wwwroot")` 提供已有静态文件，同时为状态页和表单页注册四种方法的动态路由。
 
-| 路径 | 用途 |
-| --- | --- |
-| `/`、`/index.html` | 首页 |
-| `/docs/` | 子目录首页 |
-| `/examples/table.html` | 资源列表与浏览器筛选 |
-| `/performance.html` | 超过 240 KiB 的静态文件传输 |
-| `/404.html` | 错误页面外观示例，实际状态为 200 |
-| `/missing-page` | 不存在的资源，实际状态为 404 |
+| 路径                     | 用途                             |
+| ------------------------ | -------------------------------- |
+| `/`、`/index.html`   | 首页                             |
+| `/docs/`               | 子目录首页                       |
+| `/examples/table.html` | 资源列表与浏览器筛选             |
+| `/performance.html`    | 超过 240 KiB 的静态文件传输      |
+| `/404.html`            | 错误页面外观示例，实际状态为 200 |
+| `/missing-page`        | 不存在的资源，实际状态为 404     |
 
 wwwroot 包含 12 个 HTML 文件和 2 个公共资源文件。
 `assets/style.css` 为页面提供样式；`assets/app.js` 提供表格筛选、复制等浏览器交互。
@@ -132,13 +132,13 @@ HTML 页面是不同的测试样例，并非每一个都是服务器启动所必
 
 状态页与表单页使用以下接口；这些是动态路径，不需要对应的磁盘文件。
 
-| 方法 | 路径 | 对应前端 |
-| --- | --- | --- |
-| GET / HEAD | `/api/status` | status.html 的检查按钮、请求实验 |
-| GET | `/api/query` | examples/form.html 的查询表单 |
-| POST | `/api/items` | examples/form.html 的 POST 表单、请求实验 |
-| PUT | `/api/items/42` | examples/form.html 的请求实验 |
-| DELETE | `/api/items/42` | examples/form.html 的请求实验 |
+| 方法       | 路径              | 对应前端                                  |
+| ---------- | ----------------- | ----------------------------------------- |
+| GET / HEAD | `/api/status`   | status.html 的检查按钮、请求实验          |
+| GET        | `/api/query`    | examples/form.html 的查询表单             |
+| POST       | `/api/items`    | examples/form.html 的 POST 表单、请求实验 |
+| PUT        | `/api/items/42` | examples/form.html 的请求实验             |
+| DELETE     | `/api/items/42` | examples/form.html 的请求实验             |
 
 POST / PUT 返回声明的正文字节数，DELETE 仅演示方法分发，不写入或删除文件。
 没有注册 `/redirect`、`/api/close` 或其他未被现有前端实际使用的接口。
@@ -152,5 +152,5 @@ POST / PUT 返回声明的正文字节数，DELETE 仅演示方法分发，不�
 ctest --test-dir build --output-on-failure
 ```
 
-目前 HTTP 测试有两个已知失败：HTTP/1.0 显式 keep-alive 被关闭、Connection 多值头未按 token 判断。
-这些库实现未在本次简化中修改。测试入口未捕获异常时会显示 Aborted。
+HTTP/1.0 keep-alive 和 Connection 多值解析现已通过回归测试。
+当前测试入口捕获异常并返回非零状态；本轮其他失败项见下方测试结果。

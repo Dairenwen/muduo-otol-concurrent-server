@@ -39,7 +39,7 @@ int main()
                                 HttpRequest copy(request);
                                 text(response, "PUT bytes=" + std::to_string(copy.ContentLength()) + "\n"); });
         server.AddDeleteRoute("/api/items/42", [text](const HttpRequest &, HttpResponse &response)
-                              { te xt(response, "DELETE accepted\n"); });
+                              { text(response, "DELETE accepted\n"); });
 
         std::cout << "Server: http://127.0.0.1:8080/\nPress Ctrl+C to stop.\n"
                   << std::flush;
