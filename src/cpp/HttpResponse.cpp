@@ -1,4 +1,7 @@
 #include "HttpResponse.hpp"
+#include <strings.h>
+#include <sstream>
+#include <strings.h>
 
 void HttpResponse::ReSet()
 {
@@ -70,29 +73,34 @@ void HttpResponse::SetRedirect(std::string &url, int statu)
 
 bool HttpResponse::Close()
 {
-    std::string connection;
-
-    auto it = _headers.find("Connection");
-
-    if (it != _headers.end())
+    // 响应端只在显式 close 时关闭。
+    for (const auto &header : _headers)
     {
-        connection = it->second;
+        if (strcasecmp(header.first.c_str(), "Connection") != 0)
+            continue;
 
-        // Connection 的值理论上不区分大小写，
-        // 因此统一转换为小写后再判断。
-        std::transform(connection.begin(), connection.end(), connection.begin(), [](unsigned char ch)
-                       { return static_cast<char>(std::tolower(ch)); });
+        std::istringstream values(header.second);
+        std::string token;
+
+        while (std::getline(values, token, ','))
+        {
+            const size_t first = token.find_first_not_of(" \t");
+            if (first == std::string::npos)
+                continue;
+
+            const size_t last = token.find_last_not_of(" \t");
+            token = token.substr(first, last - first + 1);
+
+            std::transform(token.begin(), token.end(), token.begin(),
+                           [](unsigned char ch)
+                           {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+
+            if (token == "close")
+                return true;
+        }
     }
 
-    if (_version == "HTTP/1.1")
-    {
-        return connection == "close";
-    }
-
-    if (_version == "HTTP/1.0")
-    {
-        return connection != "keep-alive";
-    }
-
-    return true;
+    return false;
 }

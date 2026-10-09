@@ -722,8 +722,16 @@ void testeventloop_timewheel()
                          const char result = passed ? '1' : '0';
 
                          // 先把结果写给父进程，再退出子进程，避免 EventLoop 永久运行。
-                         write(result_pipe[1], &result, sizeof(result));
-                         _exit(passed ? 0 : 1); });
+                         ssize_t written;
+                         do
+                         {
+                             written = write(result_pipe[1], &result, sizeof(result));
+                         } while (written == -1 && errno == EINTR); // 被信号中断时重试。
+                         close(result_pipe[1]);
+
+                         // 单字节结果必须完整写入；写入失败也作为测试失败。
+                         const bool write_ok = written == static_cast<ssize_t>(sizeof(result));
+                         _exit(passed && write_ok ? 0 : 1); });
 
         // 这里会一直 Poll；timerfd 事件到来后，TimeWheel 才会自动推进并触发任务。
         loop.StartEventLoop();
@@ -1750,6 +1758,546 @@ void testhttp()
 
 void testhttpserver()
 {
+    // 审查入口（仅 C++11 语法）：
+    // 1. configure 注册演示路由；2. 子进程运行服务器；3. 父进程发送真实 HTTP。
+    // 4. 按 Content-Length 解析响应，保留流水线余量；5. 汇总用例并回收子进程。
+    auto require = [](bool ok, const std::string &message)
+    {
+        if (!ok)
+            throw std::runtime_error(message);
+    };
+    const char *root_override = std::getenv("HTTP_TEST_WWWROOT");
+#ifdef HTTP_TEST_WWWROOT
+    const std::string root = root_override ? root_override : HTTP_TEST_WWWROOT;
+#else
+    const std::string root = root_override ? root_override : "wwwroot";
+#endif
+    require(Util::IsDirectory(root), "wwwroot does not exist: " + root);
+    auto configure = [&](HttpServer &server)
+    {
+        server.SetStaticDir(root);
+        server.SetThreadCount(2);
+        server.AddGetRoute("/api/status", [](const HttpRequest &, HttpResponse &response)
+                           {
+            std::string body = "{\"status\":\"ok\",\"server\":\"muduo-otol\"}\n";
+            std::string type = "application/json; charset=utf-8";
+            response.SetContent(body, type); });
+        server.AddGetRoute("/api/query", [](const HttpRequest &request, HttpResponse &response)
+                           {
+            // 当前 getter 不是 const，通过副本读取，避免修改请求或扩大源码改动范围。
+            HttpRequest copy = request;
+            std::string name = "name", tag = "tag";
+            std::string body = "name=" + copy.GetParam(name) + "\ntag=" + copy.GetParam(tag) + "\n";
+            std::string type = "text/plain; charset=utf-8";
+            response.SetContent(body, type); });
+        auto body_handler = [](const std::string &method) -> std::function<void(const HttpRequest &, HttpResponse &)>
+        {
+            return [method](const HttpRequest &request, HttpResponse &response)
+            {
+                HttpRequest copy = request;
+                std::string body = method + " bytes=" + std::to_string(copy.ContentLength()) + "\n";
+                std::string type = "text/plain; charset=utf-8";
+                response.SetContent(body, type);
+            };
+        };
+        server.AddPostRoute("/api/items", body_handler("POST"));
+        server.AddPutRoute("/api/items/[0-9]+", body_handler("PUT"));
+        server.AddDeleteRoute("/api/items/[0-9]+", [](const HttpRequest &, HttpResponse &response)
+                              {
+            std::string body = "DELETE accepted\n", type = "text/plain; charset=utf-8";
+            response.SetContent(body, type); });
+        server.AddGetRoute("/redirect", [](const HttpRequest &, HttpResponse &response)
+                           { std::string url = "/index.html"; response.SetRedirect(url); });
+        server.AddGetRoute("/api/close", [](const HttpRequest &, HttpResponse &response)
+                           {
+            std::string body = "closing\n", type = "text/plain", key = "Connection", value = "close";
+            response.SetContent(body, type);
+            response.SetHeader(key, value); });
+    };
+
+    // 手动网页测试模式保持前台运行
+    const char *serve = std::getenv("HTTP_TEST_SERVE");
+    if (serve && std::string(serve) == "1")
+    {
+        int port = 8080;
+        if (const char *value = std::getenv("HTTP_TEST_PORT"))
+        {
+            std::string text = value;
+            require(!text.empty() && text.size() <= 5 &&
+                        text.find_first_not_of("0123456789") == std::string::npos,
+                    "HTTP_TEST_PORT must be an integer from 1 to 65535");
+            port = std::stoi(text);
+            require(port >= 1 && port <= 65535, "HTTP_TEST_PORT must be from 1 to 65535");
+        }
+        HttpServer server(port);
+        configure(server);
+        std::cout << "HTTP manual test: http://127.0.0.1:" << port << "/\n"
+                  << "wwwroot: " << root << "\nPress Ctrl+C to stop.\n"
+                  << std::flush;
+        server.Start();
+        return;
+    }
+
+    // 就绪管道传端口；完成通知使用 socketpair，MSG_NOSIGNAL 避免子进程，超时退出后父进程被 SIGPIPE 杀死。所有等待由 socket 超时和 alarm 限制。
+    int ready[2], done[2];
+    require(pipe(ready) == 0, "HTTP ready pipe failed");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, done) != 0)
+    {
+        close(ready[0]);
+        close(ready[1]);
+        throw std::runtime_error("HTTP completion socketpair failed");
+    }
+    std::cout.flush();
+    const pid_t child = fork(); // 在创建工作线程之前隔离服务端。
+    if (child < 0)
+    {
+        close(ready[0]);
+        close(ready[1]);
+        close(done[0]);
+        close(done[1]);
+        throw std::runtime_error("HTTP server fork failed");
+    }
+    if (child == 0)
+    {
+        close(ready[0]);
+        close(done[0]);
+        alarm(50); // 服务端、管道等待、停止与回收均有硬超时。
+        int result = 1;
+        try
+        {
+            // HttpServer 没有公开端口 getter：先探测临时端口，若被抢占则重新选择。
+            std::unique_ptr<HttpServer> server;
+            uint16_t port = 0;
+            for (int attempt = 0; attempt < 8 && !server; ++attempt)
+            {
+                Socket probe;
+                require(probe.Create() && probe.Bind(0, "0.0.0.0"), "HTTP port probe failed");
+                sockaddr_in address{};
+                socklen_t size = sizeof(address);
+                require(getsockname(probe.GetSocketFd(), reinterpret_cast<sockaddr *>(&address), &size) == 0,
+                        "HTTP getsockname failed");
+                port = ntohs(address.sin_port);
+                probe.Close();
+                try
+                {
+                    server.reset(new HttpServer(port, 3));
+                }
+                catch (const std::runtime_error &)
+                {
+                    if (attempt == 7)
+                        throw;
+                }
+            }
+            require(server != nullptr && port != 0, "HTTP server could not select a port");
+            configure(*server);
+            ssize_t count;
+            do
+            {
+                count = write(ready[1], &port, sizeof(port));
+            } while (count < 0 && errno == EINTR);
+            require(count == sizeof(port), "HTTP port handoff failed");
+            close(ready[1]);
+            std::thread completion([&]
+                                   {
+                unsigned char client_result = 1;
+                ssize_t n;
+                do { n = recv(done[1], &client_result, sizeof(client_result), 0); } while (n < 0 && errno == EINTR);
+                result = n == sizeof(client_result) ? client_result : 1;
+                server->Stop(); });
+            try
+            {
+                server->Start();
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "[FAIL] HTTP server start: " << error.what() << '\n';
+                _exit(1); // 退出隔离进程，关闭管道并终止其线程，不遗留阻塞线程。
+            }
+            completion.join();
+            server.reset(); // 检查正常停止和工作线程回收，而非仅终止进程。
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr << "[FAIL] HTTP server: " << error.what() << '\n';
+            result = 1;
+        }
+        close(done[1]);
+        std::cout.flush();
+        std::cerr.flush();
+        _exit(result);
+    }
+
+    close(ready[1]);
+    close(done[1]);
+    size_t cases = 0, failures = 0;
+    std::exception_ptr client_error;
+    try
+    {
+        uint16_t port = 0;
+        ssize_t count;
+        do
+        {
+            count = read(ready[0], &port, sizeof(port));
+        } while (count < 0 && errno == EINTR);
+        require(count == sizeof(port) && port != 0, "HTTP server did not publish its port");
+        struct Client
+        {
+            Socket socket;
+            std::string pending;
+        };
+        struct Response
+        {
+            std::string version, body;
+            int status = 0;
+            std::unordered_map<std::string, std::string> headers;
+        };
+        auto connect_client = [&]() -> std::unique_ptr<Client>
+        {
+            std::unique_ptr<Client> client(new Client());
+            require(client->socket.CreateClient("127.0.0.1", port), "HTTP connect failed");
+            timeval timeout{};
+            timeout.tv_sec = 6;
+            require(setsockopt(client->socket.GetSocketFd(), SOL_SOCKET, SO_RCVTIMEO,
+                               &timeout, sizeof(timeout)) == 0,
+                    "HTTP recv timeout failed");
+            require(setsockopt(client->socket.GetSocketFd(), SOL_SOCKET, SO_SNDTIMEO,
+                               &timeout, sizeof(timeout)) == 0,
+                    "HTTP send timeout failed");
+            return client;
+        };
+        auto send_all = [&](Client &client, const std::string &message)
+        {
+            size_t sent = 0;
+            while (sent < message.size())
+            {
+                const ssize_t n = client.socket.Send(message.data() + sent, message.size() - sent);
+                if (n < 0 && errno == EINTR)
+                    continue;
+                require(n > 0, "HTTP send failed/timed out");
+                sent += static_cast<size_t>(n);
+            }
+        };
+        auto receive = [&](Client &client)
+        {
+            char buffer[16384];
+            ssize_t n;
+            do
+            {
+                n = client.socket.Recv(buffer, sizeof(buffer));
+            } while (n < 0 && errno == EINTR);
+            require(n > 0, "HTTP unexpected EOF or receive timeout");
+            client.pending.append(buffer, static_cast<size_t>(n));
+        };
+        // TCP 是字节流，不能将一次 recv 当成一次响应。
+        // pending 保存下一个响应的字节；HEAD 只消费头部，绝不消费正文长度。
+        auto read_response = [&](Client &client, bool head) -> Response
+        {
+            size_t end;
+            while ((end = client.pending.find("\r\n\r\n")) == std::string::npos)
+            {
+                require(client.pending.size() <= 65536, "HTTP response headers too large");
+                receive(client);
+            }
+            std::istringstream lines(client.pending.substr(0, end));
+            std::string line;
+            Response response;
+            require(static_cast<bool>(std::getline(lines, line)), "missing HTTP status line");
+            require(!line.empty() && line.back() == '\r', "status line must end with CRLF");
+            line.pop_back();
+            std::istringstream status_line(line);
+            require(static_cast<bool>(status_line >> response.version >> response.status) &&
+                        response.version.find("HTTP/1.") == 0,
+                    "invalid HTTP status line");
+            while (std::getline(lines, line))
+            {
+                // substr 已去掉最后一个头字段的 CRLF，其他头字段必须保留 CR。
+                if (!lines.eof())
+                {
+                    require(!line.empty() && line.back() == '\r', "response header must end with CRLF");
+                    line.pop_back();
+                }
+                size_t colon = line.find(':');
+                require(colon != std::string::npos, "invalid response header");
+                std::string key = line.substr(0, colon);
+                std::transform(key.begin(), key.end(), key.begin(),
+                               [](unsigned char ch)
+                               { return static_cast<char>(std::tolower(ch)); });
+                size_t first = line.find_first_not_of(" \t", colon + 1);
+                require(response.headers.emplace(key, first == std::string::npos ? "" : line.substr(first)).second,
+                        "duplicate HTTP response header: " + key);
+            }
+            client.pending.erase(0, end + 4);
+            size_t length = 0;
+            if (!head && response.status >= 200 && response.status != 204 && response.status != 304)
+            {
+                require(response.headers.count("content-length") == 1, "missing Content-Length");
+                const std::string &value = response.headers.at("content-length");
+                require(!value.empty() && value.find_first_not_of("0123456789") == std::string::npos,
+                        "invalid Content-Length");
+                length = std::stoull(value);
+                require(length <= 2 * 1024 * 1024, "unexpectedly large response body");
+            }
+            while (client.pending.size() < length)
+                receive(client);
+            response.body = client.pending.substr(0, length);
+            client.pending.erase(0, length);
+            return response;
+        };
+        auto eof = [&](Client &client)
+        {
+            require(client.pending.empty(), "extra HTTP response bytes");
+            char byte;
+            ssize_t n;
+            do
+            {
+                n = client.socket.Recv(&byte, 1);
+            } while (n < 0 && errno == EINTR);
+            require(n == 0, "server did not close connection or sent unexpected bytes");
+        };
+        auto exchange = [&](const std::string &wire, bool head) -> Response
+        {
+            auto client = connect_client();
+            send_all(*client, wire);
+            Response response = read_response(*client, head);
+            require(response.headers.at("connection") == "close", "expected close response, got keep-alive");
+            eof(*client);
+            return response;
+        };
+
+        auto request = [&](const std::string &wire) -> Response
+        {
+            return exchange(wire, false);
+        };
+        auto build_request = [](const std::string &path, const std::string &method) -> std::string
+        {
+            return method + " " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        };
+        auto get = [&](const std::string &path) -> std::string
+        {
+            return build_request(path, "GET");
+        };
+        auto run = [&](const std::string &name, const std::function<void()> &test)
+        {
+            ++cases;
+            try
+            {
+                test();
+                std::cout << ("[PASS] HttpServer: " + name + "\n");
+            }
+            catch (const std::exception &error)
+            {
+                ++failures;
+                std::cerr << ("[FAIL] HttpServer: " + name + ": " + error.what() + "\n");
+            }
+        };
+        const std::vector<std::string> pages = {
+            "/index.html", "/about.html", "/docs/index.html", "/docs/routing.html",
+            "/examples/form.html", "/examples/table.html", "/status.html", "/download.html",
+            "/contact.html", "/performance.html", "/faq.html", "/404.html"};
+        for (const auto &path : pages)
+            run("static " + path, [&]
+                {
+                    std::string expected;
+                    require(Util::ReadFile(root + path, expected), "cannot read expected page");
+                    const auto response = request(get(path));
+                    require(response.status == 200 && response.body == expected, "static status/body mismatch");
+                    require(response.headers.at("content-type") == "text/html", "HTML MIME mismatch");
+                    require(response.headers.at("content-length") == std::to_string(expected.size()), "byte length mismatch");
+                    require(response.headers.at("connection") == "close", "close header mismatch"); });
+        for (const auto &path : std::vector<std::string>{"/", "/docs/", "/docs", "/index%2Ehtml?theme=light"})
+            run("path " + path, [&]
+                {
+                    std::string expected;
+                    require(Util::ReadFile(root + (path.find("/docs") == 0 ? "/docs/index.html" : "/index.html"), expected),
+                            "cannot read directory index");
+                    const auto response = request(get(path));
+                    require(response.status == 200 && response.body == expected, "directory/decoded path mismatch"); });
+        for (const auto &path : std::vector<std::string>{"/assets/style.css", "/assets/app.js"})
+            run("asset " + path, [&]
+                {
+                    std::string expected;
+                    require(Util::ReadFile(root + path, expected), "cannot read asset");
+                    const auto response = request(get(path));
+                    require(response.status == 200 && response.body == expected, "asset body mismatch");
+                    require(response.headers.at("content-type") == Util::ExtMime(path), "asset MIME mismatch"); });
+        run("HEAD static, no body", [&]
+            {
+                std::string expected;
+                require(Util::ReadFile(root + "/performance.html", expected) && expected.size() > 65536, "large page must exceed 64 KiB");
+                const auto response = exchange(build_request("/performance.html", "HEAD"), true);
+                require(response.status == 200 && response.body.empty(), "HEAD sent a body");
+                require(response.headers.at("content-length") == std::to_string(expected.size()), "HEAD length mismatch"); });
+        const std::string status_body = "{\"status\":\"ok\",\"server\":\"muduo-otol\"}\n";
+        run("GET dynamic JSON", [&]
+            {
+                const auto response = request(get("/api/status"));
+                require(response.status == 200 && response.body == status_body, "dynamic JSON mismatch");
+                require(response.headers.at("content-type") == "application/json; charset=utf-8", "JSON MIME mismatch"); });
+        run("HEAD dynamic", [&]
+            {
+                const auto response = exchange(build_request("/api/status", "HEAD"), true);
+                require(response.status == 200 && response.body.empty() &&
+                            response.headers.at("content-length") == std::to_string(status_body.size()), "dynamic HEAD mismatch"); });
+        run("query UTF-8, plus, escaped separators", [&]
+            {
+                const auto response = request(get("/api/query?name=%E4%BD%A0%E5%A5%BD+HTTP&tag=a%26b%3D1"));
+                require(response.status == 200 && response.body == "name=你好 HTTP\ntag=a&b=1\n", "query decode mismatch"); });
+        // ContentLength 只是请求声明值；这里只检查方法分发和正文边界。
+        for (const auto &method : std::vector<std::string>{"POST", "PUT"})
+            run(method + " body and method-specific route", [&]
+                {
+                    const std::string body("a\0b\xff", 4);
+                    const std::string path = method == "POST" ? "/api/items" : "/api/items/42";
+                    const auto response = request(method + " " + path + " HTTP/1.1\r\nHost: localhost\r\n"
+                        "Content-Length: 4\r\nConnection: close\r\n\r\n" + body);
+                    require(response.status == 200 && response.body == method + " bytes=4\n", "body route mismatch"); });
+        run("DELETE regex route", [&]
+            { const auto response = request(build_request("/api/items/42", "DELETE"));
+              require(response.status == 200 && response.body == "DELETE accepted\n", "DELETE mismatch"); });
+        run("302 redirect", [&]
+            { const auto response = request(get("/redirect"));
+              require(response.status == 302 && response.headers.at("location") == "/index.html", "redirect mismatch"); });
+        for (const auto &path : std::vector<std::string>{"/missing-page", "/api/items/abc"})
+            run("404 " + path, [&]
+                { const auto response = request(get(path));
+                  require(response.status == 404 && response.body == "Not Found\n", "404 mismatch"); });
+        run("filename case follows document-root filesystem", [&]
+            {
+                std::string expected;
+                const bool exists = Util::ReadFile(root + "/INDEX.html", expected);
+                const Response response = request(get("/INDEX.html"));
+                require(response.status == (exists ? 200 : 404), "filename case differs from filesystem");
+                if (exists) require(response.body == expected, "case alias body mismatch"); });
+        run("method does not match GET route", [&]
+            { require(request(build_request("/api/status", "POST")).status == 404, "wrong method dispatched to GET"); });
+        run("HTTP/1.0 default close", [&]
+            { const auto response = request("GET /api/status HTTP/1.0\r\n\r\n");
+              require(response.version == "HTTP/1.0" && response.body == status_body, "HTTP/1.0 mismatch"); });
+        run("keep-alive sequential and pipelined requests", [&]
+            {
+                auto client = connect_client();
+                const std::string keep = "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+                send_all(*client, keep);
+                const auto first = read_response(*client, false);
+                require(first.body == status_body && first.headers.at("connection") == "keep-alive", "keep-alive failed");
+                send_all(*client, "HEAD /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n" + keep + get("/api/status"));
+                require(read_response(*client, true).body.empty(), "pipelined HEAD body");
+                require(read_response(*client, false).body == status_body, "first pipelined GET mismatch");
+                require(read_response(*client, false).body == status_body, "last pipelined GET mismatch");
+                eof(*client); });
+        run("HTTP/1.0 explicit keep-alive", [&]
+            {
+                auto client = connect_client();
+                send_all(*client, "GET /api/status HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+                const auto response = read_response(*client, false);
+                require(response.version == "HTTP/1.0" && response.headers.at("connection") == "keep-alive", "1.0 keep-alive failed");
+                send_all(*client, get("/api/status"));
+                require(read_response(*client, false).body == status_body, "1.0 reused connection failed");
+                eof(*client); });
+        run("Connection comma-separated close token", [&]
+            {
+                const Response response = request("GET /api/status HTTP/1.1\r\nHost: localhost\r\n"
+                    "Connection: keep-alive, close\r\n\r\n");
+                require(response.headers.at("connection") == "close", "Connection close token was ignored"); });
+        run("fragmented request line, headers and body", [&]
+            {
+                auto client = connect_client();
+                for (const auto &fragment : std::vector<std::string>{
+                         "PO", "ST /api/items HTTP/1.1\r", "\nHost: localhost\r\nContent-Len",
+                         "gth: 11\r\nConnection: close\r\n\r\nhello", " world"})
+                {
+                    send_all(*client, fragment);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                }
+                const auto response = read_response(*client, false);
+                require(response.status == 200 && response.body == "POST bytes=11\n", "fragmented body mismatch");
+                eof(*client); });
+        run("large POST followed by pipelined GET", [&]
+            {
+                auto client = connect_client();
+                const std::string body(256 * 1024, 'X');
+                send_all(*client, "POST /api/items HTTP/1.1\r\nHost: localhost\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\n\r\n" + body + get("/api/status"));
+                require(read_response(*client, false).body == "POST bytes=262144\n", "large POST mismatch");
+                require(read_response(*client, false).body == status_body, "body consumed next request");
+                eof(*client); });
+        run("response asks to close and discards pipeline", [&]
+            {
+                auto client = connect_client();
+                send_all(*client, "GET /api/close HTTP/1.1\r\nHost: localhost\r\n\r\n" + get("/api/status"));
+                const auto response = read_response(*client, false);
+                require(response.body == "closing\n" && response.headers.at("connection") == "close", "response close mismatch");
+                eof(*client); });
+        auto reject = [&](const std::string &name, const std::string &wire, int expected)
+        { run(name, [&]
+              { const auto response = request(wire);
+                         require(response.status == expected && response.headers.at("connection") == "close", "error response mismatch"); }); };
+        reject("missing Host", "GET / HTTP/1.1\r\n\r\n", 400);
+        reject("duplicate Content-Length", "POST /api/items HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", 400);
+        reject("invalid URL escape", get("/bad%ZZ"), 400);
+        reject("root traversal", get("/../CMakeLists.txt"), 400);
+        reject("encoded root traversal", get("/%2e%2e/CMakeLists.txt"), 400);
+        reject("unsupported Transfer-Encoding", "POST /api/items HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", 501);
+        reject("oversized body", "POST /api/items HTTP/1.1\r\nHost: a\r\nContent-Length: 999999999\r\n\r\n", 413);
+        reject("oversized request line", "GET /" + std::string(8192, 'a'), 414);
+        reject("oversized header", "GET / HTTP/1.1\r\nHost: a\r\nX: " + std::string(8192, 'a'), 431);
+        // 每个并发客户端使用不同的查询参数，检测连接间串线；再比较完整大文件。
+        run("8 concurrent clients and distinct query values", [&]
+            {
+                std::string expected;
+                require(Util::ReadFile(root + "/performance.html", expected), "cannot read concurrent page");
+                std::vector<std::future<void>> clients;
+                for (int i = 0; i < 8; ++i)
+                    clients.push_back(std::async(std::launch::async, [&, i]
+                        {
+                            const auto dynamic = request(get("/api/query?name=client" + std::to_string(i) + "&tag=" + std::to_string(i)));
+                            require(dynamic.status == 200 && dynamic.body == "name=client" + std::to_string(i) + "\ntag=" + std::to_string(i) + "\n", "concurrent client data mixed");
+                            const auto page = request(get("/performance.html"));
+                            require(page.status == 200 && page.body == expected, "concurrent large page truncated");
+                        }));
+                for (auto &client : clients) client.get(); });
+        run("inactive connection release", [&]
+            {
+                auto client = connect_client();
+                send_all(*client, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n");
+                require(read_response(*client, false).body == status_body, "idle handshake failed");
+                const auto begin = std::chrono::steady_clock::now();
+                eof(*client);
+                const auto elapsed = std::chrono::steady_clock::now() - begin;
+                require(elapsed >= std::chrono::seconds(1) && elapsed < std::chrono::seconds(6), "idle timeout outside expected interval"); });
+    }
+    catch (...)
+    {
+        client_error = std::current_exception();
+        kill(child, SIGKILL); // 基础设施失败时仅结束本次测试创建的隔离进程。
+    }
+    close(ready[0]);
+    const unsigned char result = client_error || failures ? 1 : 0;
+    // 测试失败也通知服务器 Stop；对端已退出时 send 返回错误，不产生 SIGPIPE。
+    if (!client_error)
+    {
+        ssize_t count;
+        do
+        {
+            count = send(done[0], &result, sizeof(result), MSG_NOSIGNAL);
+        } while (count < 0 && errno == EINTR);
+        if (count != sizeof(result))
+            client_error = std::make_exception_ptr(std::runtime_error("HTTP completion handoff failed"));
+    }
+    close(done[0]);
+    int status = 0;
+    pid_t waited;
+    do
+    {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    std::cout << "[HTTP SERVER SUMMARY] cases=" << cases << ", failures=" << failures << std::endl;
+    if (client_error)
+        std::rethrow_exception(client_error);
+    // 子进程正常回传同样的业务结果（0 或 1）即可；信号退出属于回收失败。
+    require(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == result,
+            "HTTP server did not exit cleanly");
+    require(failures == 0, "HTTP server test failures: " + std::to_string(failures));
 }
 
 int main()

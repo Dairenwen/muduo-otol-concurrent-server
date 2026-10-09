@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="测试反馈页面提供记录模板。这里没有联网提交入口，所有测试都可以在本地完成。"><title>把一次失败，变成可复现的请求。 · HTTP Lab</title><link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" defer></script></head>
+<body><a class="skip-link" href="#content">跳到主要内容</a><header class="top"><a class="brand" href="/"><span class="brand-icon" aria-hidden="true">H</span> HTTP Lab</a><nav class="top-links" aria-label="快捷导航"><a href="/docs/">使用指南</a><a href="/examples/form.html">请求实验</a><a class="top-cta" href="/status.html">检查服务 <span aria-hidden="true">↗</span></a></nav></header><div class="layout"><aside class="sidebar"><h2>Explore the lab</h2><nav aria-label="测试站点导航"><a href="/index.html">测试首页</a><a href="/about.html">项目介绍</a><a href="/docs/">使用指南</a><a href="/docs/routing.html">路径与路由</a><a href="/examples/form.html">表单请求</a><a href="/examples/table.html">资源清单</a><a href="/status.html">服务状态</a><a href="/download.html">发布与链接</a><a href="/contact.html" aria-current="page">测试反馈</a><a href="/performance.html">大文件传输</a><a href="/faq.html">常见问题</a><a href="/404.html">404 示例</a></nav><p class="aside-note">静态资源与动态请求<br>Linux · C++17 · HTTP/1.1</p></aside><main id="content"><div class="page-trail"><a href="/">HTTP Lab</a><span aria-hidden="true">/</span><span>contact.html</span></div><section class="hero"><span class="eyebrow">FEEDBACK / 09</span><h1>把一次失败，变成可复现的请求。</h1><p>测试反馈页面提供记录模板。这里没有联网提交入口，所有测试都可以在本地完成。</p></section><section class="panel"><h2>建议记录的信息</h2><ol class="steps"><li>请求方法、原始 URL 与 HTTP 版本。</li><li>请求头、正文长度，以及是否使用长连接。</li><li>实际状态码、Content-Length 与响应正文。</li><li>Linux 发行版、CPU 架构和构建类型。</li></ol><h2>请求记录示例</h2><pre>GET /docs/index.html HTTP/1.1
+Host: 127.0.0.1:8080
+Connection: close
+
+预期：200，text/html，完整 UTF-8 页面。</pre></section><section class="panel"><h2>缩小问题范围</h2><p>先运行自动测试，再用单个请求复现。若只在并发时出现，记录客户端数量和不同客户端的请求内容。</p><a href="/faq.html">查看常见问题 →</a></section><section class="panel"><p class="eyebrow">A USEFUL BUG REPORT</p><h2>记录预期，也记录事实。</h2><pre>测试环境：Linux 发行版 / CPU 架构 / 构建类型
+启动命令：
+请求方法与原始 URL：
+请求头与正文长度：
+预期响应：
+实际状态码与响应头：
+是否使用并发或长连接：
+可复现的最小步骤：</pre><p>使用右上角的复制按钮保存模板。站点不收集反馈，也不会把内容发送到外部服务。</p></section><section class="panel"><h2>按现象缩小范围。</h2><table><thead><tr><th>现象</th><th>先检查</th></tr></thead><tbody><tr><td>全部页面无法访问</td><td>监听端口、进程状态与容器映射</td></tr><tr><td>API 正常、页面 404</td><td>wwwroot 路径与文件大小写</td></tr><tr><td>小文件正常、大文件截断</td><td>发送缓冲区与 Content-Length</td></tr><tr><td>第二个请求出现错位</td><td>正文边界、上下文重置与流水线余量</td></tr><tr><td>长连接没有按要求关闭</td><td>Connection 头的 token 解析</td></tr></tbody></table></section><section class="end-nav"><div><small>继续探索</small><h2>下一步，也很清楚。</h2></div><a class="button secondary" href="/docs/">使用指南 <span aria-hidden="true">↗</span></a></section></main></div><footer>HTTP Lab · 本地测试页面 · <a href="/docs/">使用指南</a> · <a href="/404.html">错误页面示例</a></footer></body></html>

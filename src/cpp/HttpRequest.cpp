@@ -84,28 +84,47 @@ size_t HttpRequest::ContentLength()
  */
 bool HttpRequest::Close()
 {
-    std::string connection;
+    bool has_close = false;
+    bool has_keep_alive = false;
 
-    auto it = _headers.find("Connection");
-
-    if (it != _headers.end())
+    for (const auto &header : _headers)
     {
-        connection = it->second;
+        // HTTP 头字段名称不区分大小写。
+        if (strcasecmp(header.first.c_str(), "Connection") != 0)
+            continue;
 
-        // Connection 的值理论上不区分大小写，因此统一转换为小写后再判断。
-        std::transform(connection.begin(), connection.end(), connection.begin(), [](unsigned char ch)
-                       { return static_cast<char>(std::tolower(ch)); });
+        std::istringstream values(header.second);
+        std::string token;
+
+        // Connection 可以包含多个逗号分隔的值
+        while (std::getline(values, token, ','))
+        {
+            const size_t first = token.find_first_not_of(" \t");
+            if (first == std::string::npos)
+                continue;
+
+            const size_t last = token.find_last_not_of(" \t");
+            token = token.substr(first, last - first + 1);
+
+            std::transform(token.begin(), token.end(), token.begin(),
+                           [](unsigned char ch)
+                           {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+
+            has_close = has_close || token == "close";
+            has_keep_alive = has_keep_alive || token == "keep-alive";
+        }
     }
+
+    if (has_close)
+        return true;
 
     if (_version == "HTTP/1.1")
-    {
-        return connection == "close";
-    }
+        return false; // 默认长连接。
 
     if (_version == "HTTP/1.0")
-    {
-        return connection != "keep-alive";
-    }
+        return !has_keep_alive; // 显式 keep-alive 才保持连接
 
     return true;
 }
