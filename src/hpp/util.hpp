@@ -40,4 +40,7 @@ public:
 
     // http请求的资源路径有效性判断 对已 URL 解码的路径进行词法检查，拒绝越过资源根目录和 NULL
     static bool ValidPath(const std::string &path);
+
+    // 统一 HTTP 字段名的大小写，例如 CONTENT-TYPE -> Content-Type。
+    static std::string NormalizeHeaderName(const std::string &name);
 };

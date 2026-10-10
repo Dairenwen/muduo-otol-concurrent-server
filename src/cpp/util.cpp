@@ -220,3 +220,22 @@ bool Util::ValidPath(const std::string &path)
     }
     return true;
 }
+
+std::string Util::NormalizeHeaderName(const std::string &name)
+{
+    std::string result = name;
+    bool upper = true;
+
+    for (char &ch : result)
+    {
+        if (ch >= 'A' && ch <= 'Z')
+            ch = static_cast<char>(ch - 'A' + 'a');
+
+        if (upper && ch >= 'a' && ch <= 'z')
+            ch = static_cast<char>(ch - 'a' + 'A');
+
+        upper = ch == '-';
+    }
+
+    return result;
+}

@@ -1,4 +1,5 @@
 #include "HttpResponse.hpp"
+#include "util.hpp"
 #include <strings.h>
 #include <sstream>
 #include <strings.h>
@@ -15,17 +16,17 @@ void HttpResponse::ReSet()
 
 void HttpResponse::SetHeader(std::string &key, std::string &val)
 {
-    _headers[key] = val;
+    _headers[Util::NormalizeHeaderName(key)] = val;
 }
 
 bool HttpResponse::HasHeader(std::string &key)
 {
-    return _headers.find(key) != _headers.end();
+    return _headers.find(Util::NormalizeHeaderName(key)) != _headers.end();
 }
 
 std::string HttpResponse::GetHeader(std::string &key)
 {
-    auto it = _headers.find(key);
+    auto it = _headers.find(Util::NormalizeHeaderName(key));
 
     if (it == _headers.end())
     {

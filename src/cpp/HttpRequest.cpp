@@ -1,19 +1,20 @@
 #include "HttpRequest.hpp"
+#include "util.hpp"
 #include <strings.h>
 
 void HttpRequest::SetHeader(const std::string &key, const std::string &val)
 {
-    _headers[key] = val;
+    _headers[Util::NormalizeHeaderName(key)] = val;
 }
 
 bool HttpRequest::HasHeader(const std::string &key)
 {
-    return _headers.find(key) != _headers.end();
+    return _headers.find(Util::NormalizeHeaderName(key)) != _headers.end();
 }
 
 std::string HttpRequest::GetHeader(std::string &key)
 {
-    auto it = _headers.find(key);
+    auto it = _headers.find(Util::NormalizeHeaderName(key));
 
     // 没有找到对应请求头
     if (it == _headers.end())

@@ -179,8 +179,57 @@ void HttpServer::Route(HttpRequest &request, HttpResponse &response)
     }
 }
 
-void HttpServer::SendResponse(const ConnPtr &conn, const HttpResponse &response, bool head_only)
+bool HttpServer::IsValidResponseHeader(const std::string &name, const std::string &value)
 {
+    if (name.empty())
+        return false;
+
+    // HTTP 字段名允许字母、数字和这些符号。
+    const std::string symbols = "!#$%&'*+-.^_`|~";
+    for (unsigned char ch : name)
+    {
+        const bool letter = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+        const bool digit = ch >= '0' && ch <= '9';
+
+        if (!letter && !digit && symbols.find(ch) == std::string::npos)
+            return false;
+    }
+
+    // 字段值禁止 CR、LF、NUL 等控制字符，允许水平制表符。
+    for (unsigned char ch : value)
+    {
+        if ((ch < 0x20 && ch != '\t') || ch == 0x7f)
+            return false;
+    }
+
+    return true;
+}
+
+bool HttpServer::SendResponse(const ConnPtr &conn, const HttpResponse &response, bool head_only)
+{
+    // 必须先完成检查，再构造响应，避免混入原响应的部分内容。
+    for (const auto &header : response._headers)
+    {
+        if (IsValidResponseHeader(header.first, header.second))
+            continue;
+
+        ERR_LOG("拒绝发送非法 HTTP 响应头，连接=%llu", static_cast<unsigned long long>(conn->GetConnId()));
+
+        const std::string body = "Internal Server Error\n";
+        std::ostringstream error;
+        error << response._version << " 500 Internal Server Error\r\n"
+              << "Connection: close\r\n"
+              << "Content-Type: text/plain; charset=utf-8\r\n"
+              << "Content-Length: " << body.size() << "\r\n"
+              << "\r\n";
+
+        if (!head_only)
+            error << body;
+
+        conn->Send(error.str());
+        return false;
+    }
+
     std::ostringstream message;
     message << response._version << " " << response._statu << " " << Util::StatusDesc(response._statu) << "\r\n";
     const bool no_body = response._statu < 200 || response._statu == 204 || response._statu == 304;
@@ -199,6 +248,7 @@ void HttpServer::SendResponse(const ConnPtr &conn, const HttpResponse &response,
         message << response._body;
     conn->Send(message.str());
     DBG_LOG("发送 HTTP 响应，连接=%llu，状态=%d，正文长度=%zu", static_cast<unsigned long long>(conn->GetConnId()), response._statu, response._body.size());
+    return true;
 }
 
 void HttpServer::OnConnected(const ConnPtr &conn)
@@ -246,9 +296,9 @@ void HttpServer::OnMessage(const ConnPtr &conn, Buffer &buffer)
         }
         std::string key = "Connection", value = close ? "close" : "keep-alive";
         response.SetHeader(key, value);
-        SendResponse(conn, response, request._method == "HEAD"); // 为head获取响应信息，但不接受正文
+        bool valid_response = SendResponse(conn, response, request._method == "HEAD"); // 为head获取响应信息，但不接受正文
 
-        if (close)
+        if (close || !valid_response)
         {
             buffer.clear();
             conn->Shutdown();

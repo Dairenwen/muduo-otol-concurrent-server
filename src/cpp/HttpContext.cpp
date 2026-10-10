@@ -147,17 +147,7 @@ bool HttpContext::ParseHttpHead(const std::string &line)
     if (colon == std::string::npos || colon == 0 || !std::all_of(line.begin(), line.begin() + colon, IsToken))
         return SetError(400);
 
-    std::string key = line.substr(0, colon);
-    // 统一头字段名称， Content-Length
-    bool upper = true;
-    for (char &ch : key)
-    {
-        if (ch >= 'A' && ch <= 'Z')
-            ch = static_cast<char>(ch - 'A' + 'a');
-        if (upper && ch >= 'a' && ch <= 'z')
-            ch = static_cast<char>(ch - 'a' + 'A');
-        upper = ch == '-';
-    }
+    std::string key = Util::NormalizeHeaderName(line.substr(0, colon)); // 统一头字段名称， Content-Length
 
     // 只去掉值两端的空格和 TAB，保留值内部的空白。
     const size_t begin = line.find_first_not_of(" \t", colon + 1), end = line.find_last_not_of(" \t");
@@ -210,6 +200,11 @@ bool HttpContext::RecvHttpHead(Buffer &buffer)
             // 不支持 Transfer-Encoding，同时出现请求错误，未实现返回501
             if (_request.HasHeader("Transfer-Encoding"))
                 return SetError(_request.HasHeader("Content-Length") ? 400 : 501);
+
+            // 暂不支持 Expect：收到完整请求头后立即拒绝
+            if (_request._version == "HTTP/1.1" && _request.HasHeader("Expect"))
+                return SetError(417);
+
             _recv_statu = RECV_HTTP_BODY;
             return true;
         }

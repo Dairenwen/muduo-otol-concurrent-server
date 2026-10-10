@@ -43,6 +43,7 @@
 #include <sys/resource.h>
 #include <fstream>
 #include <functional>
+#include <limits.h>
 using namespace std;
 
 // 测试时间轮的timerfd功能
@@ -1769,6 +1770,63 @@ namespace http_test
             throw std::runtime_error(message);
     }
 
+    std::string ParentDirectory(const std::string &path)
+    {
+        const size_t slash = path.find_last_of('/');
+        if (slash == std::string::npos)
+            return "";
+        return slash == 0 ? "/" : path.substr(0, slash);
+    }
+
+    std::string FindWwwroot(const std::string &configured_root)
+    {
+        char resolved[PATH_MAX];
+        const char *override_root = std::getenv("HTTP_TEST_WWWROOT");
+        if (override_root != NULL)
+        {
+            // 用户显式指定的目录必须有效，不悄悄改用其他网页。
+            Check(realpath(override_root, resolved) != NULL && Util::IsDirectory(resolved),
+                  "invalid HTTP_TEST_WWWROOT: " + std::string(override_root));
+            return resolved;
+        }
+        if (realpath(configured_root.c_str(), resolved) != NULL && Util::IsDirectory(resolved))
+            return resolved;
+
+        // CMake 的源码路径、当前目录、源码文件和可执行文件位置都可作为起点。
+        // 沿父目录寻找项目已有资源，找到后统一使用绝对路径。
+        std::vector<std::string> starts;
+        starts.push_back(ParentDirectory(configured_root));
+        if (realpath(".", resolved) != NULL)
+            starts.push_back(resolved);
+        if (realpath(__FILE__, resolved) != NULL)
+            starts.push_back(ParentDirectory(resolved));
+        const ssize_t length = readlink("/proc/self/exe", resolved, sizeof(resolved) - 1);
+        if (length > 0 && length < static_cast<ssize_t>(sizeof(resolved) - 1))
+        {
+            resolved[length] = '\0';
+            starts.push_back(ParentDirectory(resolved));
+        }
+
+        const std::vector<std::string> locations = {"wwwroot", "release/wwwroot"};
+        for (std::string directory : starts)
+        {
+            while (!directory.empty())
+            {
+                for (const std::string &location : locations)
+                {
+                    const std::string candidate = directory + "/" + location;
+                    if (realpath(candidate.c_str(), resolved) != NULL && Util::IsDirectory(resolved))
+                        return resolved;
+                }
+                const std::string parent = ParentDirectory(directory);
+                if (parent == directory)
+                    break;
+                directory = parent;
+            }
+        }
+        throw std::runtime_error("wwwroot not found; set HTTP_TEST_WWWROOT to its absolute path");
+    }
+
     struct Suite
     {
         size_t cases, failures;
@@ -1971,8 +2029,7 @@ namespace http_test
             catch (const std::exception &)
             {
                 Text(response, "handler caught exception\n");
-            }
-        });
+            } });
         server.AddGetRoute("/_test/large", [](const HttpRequest &, HttpResponse &response)
                            {
         std::string body(2 * 1024 * 1024, '\0');
@@ -1986,6 +2043,20 @@ namespace http_test
         Text(response, "header\n");
         std::string key = "X-Test", value = "safe\r\nX-Injected: yes";
         response.SetHeader(key, value); });
+        // 制造大小写不同的同名字段，检查最终响应是否正确覆盖且没有重复字段。
+        server.AddGetRoute("/_test/header-case",
+            [](const HttpRequest &, HttpResponse &response)
+            {
+                std::string type_key = "content-type";
+                std::string old_type = "application/json";
+                response.SetHeader(type_key, old_type);
+
+                std::string connection_key = "connection";
+                std::string connection_value = "keep-alive";
+                response.SetHeader(connection_key, connection_value);
+
+                Text(response, "header case\n");
+            });
     }
 
     // 每个服务器在独立进程中运行。崩溃测试不会中断其余测试。Stop 走实际停止和析构流程；只有超过等待上限时才终止本次创建的进程。
@@ -2156,10 +2227,28 @@ namespace http_test
         throw std::runtime_error("cannot read server RSS");
     }
 
-    void Webbench(uint16_t port, int clients, int seconds, const std::string &path)
+    void Webbench(uint16_t port, int clients, int seconds, const std::string &path,
+                  const std::string &root)
     {
         const char *override_path = std::getenv("HTTP_TEST_WEBBENCH");
-        const std::string executable = override_path ? override_path : "test/webbench/webbench";
+        std::string executable = override_path ? override_path : "test/webbench/webbench";
+        if (override_path == NULL)
+        {
+            // root 已经是绝对路径；从资源目录向上查找，避免依赖启动目录。
+            for (std::string directory = root; !directory.empty();)
+            {
+                const std::string candidate = directory + "/test/webbench/webbench";
+                if (access(candidate.c_str(), X_OK) == 0)
+                {
+                    executable = candidate;
+                    break;
+                }
+                const std::string parent = ParentDirectory(directory);
+                if (parent == directory)
+                    break;
+                directory = parent;
+            }
+        }
         Check(access(executable.c_str(), X_OK) == 0,
               "webbench missing; build it in Docker or set HTTP_TEST_WEBBENCH");
         int output[2];
@@ -2231,15 +2320,13 @@ namespace http_test
 void testhttpserver()
 {
     using namespace http_test;
-    const char *override_root = std::getenv("HTTP_TEST_WWWROOT");
 #ifdef HTTP_TEST_WWWROOT
     const std::string configured_root = HTTP_TEST_WWWROOT;
 #else
     const std::string configured_root = "wwwroot";
 #endif
-    // 网页可以位于源码目录或 release；显式环境变量始终优先。
-    const std::string root = override_root ? override_root : (Util::IsDirectory(configured_root) ? configured_root : "release/wwwroot");
-    Check(Util::IsDirectory(root), "wwwroot missing: " + root);
+    const std::string root = FindWwwroot(configured_root);
+    std::cout << "[HTTP TEST ROOT] " << root << std::endl;
     // 保留原来的手动网页测试入口；没有指定时运行自动测试。
     const char *manual = std::getenv("HTTP_TEST_SERVE");
     if (manual && std::string(manual) == "1")
@@ -2261,6 +2348,75 @@ void testhttpserver()
     ServerProcess server(root);
     const uint16_t port = server.port;
     const std::string status_body = "{\"status\":\"ok\",\"server\":\"muduo-otol\"}\n";
+
+    suite.Run("request header names ignore case", []()
+    {
+        Buffer buffer;
+        buffer.WriteStringAndPush(
+            "GET / HTTP/1.1\r\n"
+            "hOsT: localhost\r\n"
+            "aUtHoRiZaTiOn: Bearer AbC123\r\n"
+            "eTaG: CaseSensitiveToken\r\n"
+            "\r\n");
+
+        HttpContext context;
+        context.RecvHttpRequest(buffer);
+        Check(context.RecvStatu() == RECV_HTTP_OVER, "request parsing failed");
+        HttpRequest &request = context.Request();
+        const std::vector<std::string> names = {
+            "authorization", "Authorization", "AUTHORIZATION"};
+        for (std::string name : names)
+        {
+            Check(request.HasHeader(name), "request header not found");
+            Check(request.GetHeader(name) == "Bearer AbC123",
+                  "request header value changed or missing");
+        }
+        std::string etag = "ETag";
+        Check(request.HasHeader(etag) && request.GetHeader(etag) == "CaseSensitiveToken",
+              "ETag lookup failed");
+
+        // 新名称仅大小写不同，应更新原字段；字段值仍区分大小写。
+        request.SetHeader("AUTHORIZATION", "Bearer NewToken");
+        std::string authorization = "Authorization";
+        Check(request.GetHeader(authorization) == "Bearer NewToken",
+              "request header was not updated");
+    });
+    suite.Run("response header names ignore case", []()
+    {
+        HttpResponse response;
+        std::string key = "content-type";
+        std::string value = "application/json";
+        response.SetHeader(key, value);
+        const std::vector<std::string> names = {
+            "content-type", "Content-Type", "CONTENT-TYPE"};
+        for (std::string name : names)
+        {
+            Check(response.HasHeader(name), "response header not found");
+            Check(response.GetHeader(name) == value, "response header lookup failed");
+        }
+        std::string body = "ABC";
+        std::string type = "text/plain; charset=utf-8";
+        response.SetContent(body, type);
+        Check(response.GetHeader(key) == type, "SetContent did not replace the old content type");
+
+        std::string location = "location";
+        std::string old_url = "/old";
+        std::string new_url = "/new";
+        response.SetHeader(location, old_url);
+        response.SetRedirect(new_url);
+        Check(response.GetHeader(location) == new_url,
+              "SetRedirect did not replace the old location");
+    });
+    suite.Run("response headers have no case duplicates", [&]()
+    {
+        // Client::Read 按不区分大小写的名称检查重复字段，不会只保留最后一个值。
+        const Response response = Exchange(port, Wire("GET", "/_test/header-case"));
+        Check(response.status == 200 && response.body == "header case\n",
+              "response status or body mismatch");
+        Check(response.headers.at("content-type") == "text/plain; charset=utf-8",
+              "wrong final content type");
+        Check(response.headers.at("connection") == "close", "wrong final connection policy");
+    });
 
     // 第一部分：重写已有覆盖。比较真实文件字节、MIME、长度和连接关闭状态。
     const std::vector<std::string> files = {
@@ -2359,6 +2515,72 @@ void testhttpserver()
         for (const std::string &fragment : fragments)
         { client.Send(fragment); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
         Check(client.Read().body == "POST bytes=11\n", "fragmented request failed"); client.Eof(); });
+
+    // 暂不支持 Expect：客户端只发请求头、等待确认时，也必须立即得到 417。
+    // 一秒接收超时短于测试服务的三秒空闲超时，避免把空闲关闭误判为主动拒绝。
+    const std::vector<std::pair<std::string, std::string> > expectations = {
+        {"100-continue", "Expect: 100-continue"},
+        {"mixed case", "eXpEcT: 100-CoNtInUe"},
+        {"unknown value", "Expect: unsupported"},
+        {"empty value", "Expect:"},
+        {"duplicate fields", "Expect: 100-continue\r\nexpect: unsupported"}};
+    for (const std::pair<std::string, std::string> &expectation : expectations)
+    {
+        suite.Run("reject Expect " + expectation.first, [&, expectation]()
+        {
+            Client client(port, 1);
+            client.Send("POST /api/items HTTP/1.1\r\nHost: a\r\n" + expectation.second +
+                        "\r\nContent-Length: 10\r\n\r\n");
+            const Response response = client.Read();
+            Check(response.status == 417 && response.body == "Expectation Failed\n",
+                  "Expect was not rejected before receiving the body");
+            Check(response.headers.at("connection") == "close", "Expect rejection kept connection alive");
+            client.Eof();
+        });
+    }
+    suite.Run("fragmented Expect headers", [&]()
+    {
+        Client client(port, 1);
+        client.Send("POST /api/items HTTP/1.1\r\nHost: a\r\nExpect: 100-con");
+        pollfd event = {client.Fd(), POLLIN, 0};
+        Check(poll(&event, 1, 10) == 0, "Expect rejected before request headers were complete");
+        client.Send("tinue\r\nContent-Length: 10\r\n\r\n");
+        const Response response = client.Read();
+        Check(response.status == 417 && response.headers.at("connection") == "close",
+              "fragmented Expect did not produce a closing 417 response");
+        client.Eof();
+    });
+    suite.Run("Expect rejects already received body and following pipeline", [&]()
+    {
+        Client client(port);
+        // 正文和下一条请求已到达时，仍应拒绝本次请求并丢弃后续数据。
+        client.Send("POST /api/items HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n"
+                    "Content-Length: 10\r\n\r\n0123456789" + Wire("GET", "/api/status"));
+        const Response response = client.Read();
+        Check(response.status == 417 && response.headers.at("connection") == "close",
+              "Expect reached the handler or kept the pipeline alive");
+        client.Eof();
+        Check(Exchange(port, Wire("GET", "/api/status")).body == status_body,
+              "server unavailable after rejecting Expect");
+    });
+    suite.Run("HEAD with Expect has no response body", [&]()
+    {
+        const Response response = Exchange(port,
+            "HEAD /api/status HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n"
+            "Content-Length: 10\r\n\r\n", true);
+        Check(response.status == 417 && response.body.empty() &&
+              response.headers.at("content-length") == std::to_string(std::string("Expectation Failed\n").size()),
+              "HEAD Expect error response was incorrect");
+    });
+    suite.Run("HTTP/1.0 ignores Expect", [&]()
+    {
+        const Response response = Exchange(port,
+            "POST /api/items HTTP/1.0\r\nExpect: 100-continue\r\n"
+            "Content-Length: 10\r\n\r\n0123456789");
+        Check(response.version == "HTTP/1.0" && response.status == 200 && response.body == "POST bytes=10\n",
+              "HTTP/1.0 Expect changed normal body handling");
+    });
+
     suite.Run("large POST then GET boundary", [&]()
               {
         Client client(port);
@@ -2394,6 +2616,9 @@ void testhttpserver()
         {"duplicate length", "POST /api/items HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\nx", 400},
         {"TE plus CL", "POST /api/items HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\nx", 400},
         {"unsupported chunked", "POST /api/items HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", 501},
+        {"Expect with missing Host", "POST /api/items HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n", 400},
+        {"Expect with invalid length", "POST /api/items HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: -1\r\n\r\n", 400},
+        {"Expect with oversized body", "POST /api/items HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 16777217\r\n\r\n", 413},
         {"bad escape", Wire("GET", "/bad%ZZ"), 400},
         {"traversal", Wire("GET", "/../CMakeLists.txt"), 400},
         {"encoded traversal", Wire("GET", "/%2e%2e/CMakeLists.txt"), 400},
@@ -2428,23 +2653,27 @@ void testhttpserver()
                 const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
                 std::cout << "[TIMEOUT] kind=" << kind << " elapsed_ms=" << ms << std::endl;
                 Check(ms >= 1500 && ms < 5000, "3-second idle timeout outside expected window"); });
-        suite.Run("finaltest incomplete request total deadline", [&]()
+        suite.Run("finaltest partial input refresh then idle close", [&]()
                   {
             ServerProcess isolated(root, 2);
             Client client(isolated.port);
             client.Send("GET /api/status HTTP/1.1\r\nX-Slow: ");
-            bool closed = false;
             for (int i = 0; i < 6; ++i)
             {
-                // 每 600 ms 发送一字节，持续刷新空闲计时器。
+                // 按已确定的策略：持续有数据就保持活跃，不限制接收总时长。
                 std::this_thread::sleep_for(std::chrono::milliseconds(600));
                 pollfd event = {client.Fd(), POLLIN, 0};
-                if (poll(&event, 1, 0) > 0) { closed = true; break; }
+                int ready;
+                do { ready = poll(&event, 1, 0); } while (ready < 0 && errno == EINTR);
+                Check(ready == 0, "partial request closed while input remained active");
                 client.Send("a");
             }
-            client.Close();
-            // 3.6 秒是本测试的完整请求接收预算；当前接口只配置了空闲超时。
-            Check(closed, "trickle input bypassed idle timeout; no absolute request deadline"); });
+            // 停止发送后应由空闲计时器回收，时间轮允许一秒刻度误差。
+            const std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+            client.Eof();
+            const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+            std::cout << "[TIMEOUT] active_partial_ms=3600 idle_close_ms=" << ms << std::endl;
+            Check(ms >= 900 && ms < 3500, "2-second idle timeout outside expected window"); });
         suite.Run("finaltest active keep-alive refresh", [&]()
                   {
             Client client(port);
@@ -2535,8 +2764,35 @@ void testhttpserver()
                   "server teardown failed after locally handled exception; wait_status=" + std::to_string(status)); });
         suite.Run("finaltest response header injection rejection", [&]()
                   {
-            const Response response = Exchange(port, Wire("GET", "/_test/header"));
-            Check(response.headers.count("x-injected") == 0, "SetHeader accepted CRLF and injected a second header"); });
+                    const Response response =
+                        Exchange(port, Wire("GET", "/_test/header"));
+
+                    Check(response.status == 500,
+                        "invalid response header did not produce HTTP 500");
+                    Check(response.body == "Internal Server Error\n",
+                        "invalid response header leaked the original body");
+                    Check(response.headers.count("x-injected") == 0,
+                        "injected header reached the client");
+
+                    // 检查 HEAD 错误响应不发送正文。
+                    const Response head =
+                        Exchange(port, Wire("HEAD", "/_test/header"), true);
+                    Check(head.status == 500 && head.body.empty(),
+                        "HEAD error response was incorrect");
+
+                    // 第一条请求出错后，不应继续响应同一连接中的第二条请求。
+                    Client client(port);
+                    client.Send(Wire("GET", "/_test/header", false) +
+                                Wire("GET", "/api/status"));
+
+                    Check(client.Read().status == 500,
+                        "pipeline did not receive HTTP 500");
+                    client.Eof();
+
+                    // 当前连接关闭后，服务仍应正常处理其他连接。
+                    Check(Exchange(port, Wire("GET", "/api/status")).body == status_body,
+                        "server unavailable after rejecting invalid response header"); });
+
         suite.Run("finaltest bounded pipeline output memory", [&]()
                   {
             ServerProcess isolated(root);
@@ -2570,7 +2826,7 @@ void testhttpserver()
                 std::string expected;
                 Check(Util::ReadFile(root + (path == "/" ? "/index.html" : path), expected), "stress fixture read failed");
                 Check(Exchange(port, Wire("GET", path)).body == expected, "pre-stress response mismatch");
-                Webbench(port, clients, 3, path);
+                Webbench(port, clients, 3, path, root);
                 Check(Exchange(port, Wire("GET", path)).body == expected, "post-stress response mismatch"); });
     };
     finaltest();
