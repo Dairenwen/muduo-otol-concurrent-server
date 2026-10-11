@@ -259,8 +259,8 @@ void HttpServer::OnConnected(const ConnPtr &conn)
 
 void HttpServer::OnMessage(const ConnPtr &conn, Buffer &buffer)
 {
-    // Shutdown 可能再次调用消息回调，正在关闭的连接不再分发请求。
-    if (conn->GetConnStatu() != CONNECTED)
+    // Shutdown 可能再次调用消息回调，正在关闭的连接或缓冲区积压不再分发请求。
+    if (conn->GetConnStatu() != CONNECTED || conn->IsReadPaused())
         return;
 
     HttpContext *context = conn->GetContext().get<HttpContext>(); // 转换为 HttpContext 类型
@@ -270,7 +270,8 @@ void HttpServer::OnMessage(const ConnPtr &conn, Buffer &buffer)
         conn->Shutdown();
         return;
     }
-    while (buffer.ReadAbleSize() > 0)
+    // 即使后续请求已经收到，发送积压时也先停止生成响应。
+    while (!conn->IsReadPaused() && buffer.ReadAbleSize() > 0)
     {
         context->RecvHttpRequest(buffer);
         if (context->RecvStatu() != RECV_HTTP_OVER && context->RecvStatu() != RECV_HTTP_ERROR)

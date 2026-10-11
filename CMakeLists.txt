@@ -46,7 +46,7 @@ if(BUILD_TESTING)
     add_executable(test_runner "${CMAKE_CURRENT_SOURCE_DIR}/test/test.cpp")
     target_link_libraries(test_runner PRIVATE server)
     target_compile_definitions(test_runner PRIVATE
-        HTTP_TEST_WWWROOT="${CMAKE_CURRENT_SOURCE_DIR}/wwwroot")
+        HTTP_TEST_WWWROOT="${RELEASE_DIR}/wwwroot")
     # 原有测试在 assert 中执行操作，Release 构建也必须保留断言。
     target_compile_options(test_runner PRIVATE -UNDEBUG)
     set_target_properties(test_runner PROPERTIES OUTPUT_NAME test)
@@ -60,6 +60,6 @@ install(TARGETS server server_shared server_main
     RUNTIME DESTINATION . LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/hpp/"
     DESTINATION include/server FILES_MATCHING PATTERN "*.hpp")
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/wwwroot/" DESTINATION wwwroot)
+install(DIRECTORY "${RELEASE_DIR}/wwwroot/" DESTINATION wwwroot)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/release/README.md"
     "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" DESTINATION .)

@@ -7,6 +7,9 @@
 #include <functional>
 #include <memory>
 
+const uint64_t OUTPUT_HIGH_WATER = 8ULL * 1024 * 1024; // 输出暂停大小
+const uint64_t OUTPUT_LOW_WATER = 4ULL * 1024 * 1024;  // 输出继续大小
+
 typedef enum
 {
     CONNECTING,
@@ -36,6 +39,7 @@ private:
     ConnStatu _statu;
     EventLoop *_loop; // 一个连接对应一个loop归属于一个线程
     bool _enable_inactive_close;
+    bool _read_paused; // 发送积压时暂停读取
 
     ConnectedCallback _connected_callback;
     MessageCallback _message_callback;
@@ -81,6 +85,7 @@ public:
                         const AnyCallback &event);
 
     int GetSocketfd() const;
+    bool IsReadPaused() const;
     uint64_t GetConnId() const;
     ConnStatu GetConnStatu() const;
     Buffer &GetInBuffer();

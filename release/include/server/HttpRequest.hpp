@@ -2,8 +2,9 @@
 #include <string>
 #include <unordered_map>
 #include <regex>
-#include <algorithm>
+#include <sstream>
 #include <cctype>
+#include <algorithm>
 #include <stdexcept>
 
 class HttpRequest

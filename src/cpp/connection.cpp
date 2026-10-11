@@ -6,7 +6,7 @@
 
 Connection::Connection(EventLoop *loop, int fd, uint64_t conn_id)
     : _conn_id(conn_id), _socket(fd), _statu(CONNECTING),
-      _loop(loop), _enable_inactive_close(false)
+      _loop(loop), _enable_inactive_close(false), _read_paused(false)
 {
     if (loop == nullptr || fd < 0)
         throw std::invalid_argument("Connection requires a loop and a valid fd");
@@ -52,6 +52,10 @@ void Connection::HandleRead()
         ERR_LOG("连接还未建立，无法读取数据");
         return;
     }
+
+    if (_read_paused) // 缓冲区有积压现象，暂停读取
+        return;
+
     char data[65536];
     ssize_t ret = _socket.Recv(data, sizeof(data));
     if (ret == 0)
@@ -79,6 +83,13 @@ void Connection::SendInLoop(const std::string &msg) // 只负责写入输出缓�
         return;
 
     _Out_buffer.WriteStringAndPush(msg);
+
+    if (!_read_paused && _Out_buffer.ReadAbleSize() >= OUTPUT_HIGH_WATER)
+    {
+        _read_paused = true;
+        _channel->DisableRead();
+    }
+
     _channel->EnableWrite(); // 开启写事件监控
     _channel->Update();
 }
@@ -107,6 +118,22 @@ void Connection::HandleWrite()
         if (ret == 0)
             return;
         _Out_buffer.MoveReaderPtr(ret);
+    }
+
+    // 新增：积压减小后，恢复读取和后续请求处理。只有正常连接才能恢复读取；关闭中的连接继续发送剩余数据。
+    if (_statu == CONNECTED && _read_paused && _Out_buffer.ReadAbleSize() <= OUTPUT_LOW_WATER)
+    {
+        _read_paused = false;
+        _channel->EnableRead();
+        _channel->Update();
+
+        // 请求可能已经在输入缓冲区里，必须主动继续处理
+        if (_In_buffer.ReadAbleSize() > 0 && _message_callback)
+            _message_callback(shared_from_this(), _In_buffer);
+
+        // 消息回调可能关闭连接，关闭后不要继续操作 Channel。
+        if (_statu == DISCONNECTED)
+            return;
     }
 
     if (_Out_buffer.ReadAbleSize() == 0)
@@ -157,6 +184,7 @@ void Connection::Release() // 真正释放连接
         return; // 同一轮可能同时有读、错误、挂断事件，只关闭一次
 
     _statu = DISCONNECTED;
+    _read_paused = false;
     _loop->CancelTask(_conn_id); // 及时取消任务，防止使用空指针
     _channel->DisableAll();
     _channel->Remove(); // 先移除 epoll 监控，再关闭 fd
@@ -314,6 +342,13 @@ Connection::~Connection()
         _channel->Remove();
     }
     // Socket 的析构函数关闭 fd
+}
+
+bool Connection::IsReadPaused() const
+{
+    // 只能在连接所属loop中查询
+    assert(_loop->IsInLoopThread());
+    return _read_paused;
 }
 
 int Connection::GetSocketfd() const { return _socket.GetSocketFd(); }

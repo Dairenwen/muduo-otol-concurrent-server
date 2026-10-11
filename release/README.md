@@ -4,8 +4,10 @@
 
 - Linux；项目使用 epoll、eventfd 和 timerfd。
 - C++17 编译器、CMake 3.16 或更新版本，以及线程库。
-- 当前目录中的二进制在 Ubuntu 24.04 / aarch64（ARM64）环境构建。
+- 当前目录中的二进制在 Ubuntu 24.04.4 / aarch64（ARM64）环境构建，使用 GCC 13.3 和 glibc 2.39。
   其他 CPU 架构应在对应 Linux 环境重新编译；这些二进制不能直接在 macOS 上运行。
+- 二进制需要系统提供 `GLIBC_2.38`、`GLIBCXX_3.4.32` 等运行库符号。
+  本包已在上述构建环境验证；旧版 Linux 发行版可能需要从源码重新构建。
 
 ## 从源码构建
 
@@ -18,8 +20,9 @@ cmake --install build --prefix "$PWD/release"
 ```
 
 构建生成 `release/server` 与 `release/lib` 下的动静态库。
-安装命令同步头文件、网页、README 和 LICENSE，不自动打包或清空目录。
-修改源码后，重复以上命令即可覆盖同名产物。
+安装命令同步头文件、网页、README 和 LICENSE；修改源码后重复这些命令即可覆盖同名产物。
+网页保存在 `release/wwwroot`，自动测试和安装均使用该目录。
+构建和安装不自动清空目录。
 
 ## 启动服务器
 
@@ -146,11 +149,19 @@ POST / PUT 返回声明的正文字节数，DELETE 仅演示方法分发，不�
 
 ## 运行测试
 
-回到项目根目录执行：
+以下命令用于完整源码仓库；独立二进制发布包不包含测试程序和 Webbench。
+已有可用的 `test/webbench/webbench` 时，回到项目根目录执行：
 
 ```sh
 ctest --test-dir build --output-on-failure
 ```
 
-HTTP/1.0 keep-alive 和 Connection 多值解析现已通过回归测试。
-当前测试入口捕获异常并返回非零状态；本轮其他失败项见下方测试结果。
+当前仓库的 Webbench 子模块缺少 `.gitmodules` 映射。新克隆的仓库可以先在外部目录
+获取并构建 Webbench，再通过环境变量指定其可执行文件：
+
+```sh
+git clone https://github.com/tamlok/webbench.git /tmp/muduo-webbench
+make -C /tmp/muduo-webbench webbench
+HTTP_TEST_WEBBENCH=/tmp/muduo-webbench/webbench \
+    ctest --test-dir build --output-on-failure
+```

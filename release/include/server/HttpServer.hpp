@@ -24,10 +24,11 @@ private:
     std::string _static_dir; // 静态资源目录
     TcpServer _server;       // TCP服务器
 private:
+    bool IsValidResponseHeader(const std::string &name, const std::string &value);                // 检查响应头是否非法含有\r\n
     void Route(HttpRequest &request, HttpResponse &response);                                     // 路由入口，选择静态资源或动态处理。
     bool FileHandler(const HttpRequest &request, HttpResponse &response);                         // 处理静态资源，未找到返回 false。
     void Dispatcher(HttpRequest &request, HttpResponse &response);                                // 按方法和路径查找动态路由并调用处理函数。
-    void SendResponse(const ConnPtr &conn, const HttpResponse &response, bool head_only = false); // HEAD 只发送头部。
+    bool SendResponse(const ConnPtr &conn, const HttpResponse &response, bool head_only = false); // HEAD 只发送头部
     void OnConnected(const ConnPtr &conn);                                                        // 连接建立时的回调
     void OnMessage(const ConnPtr &conn, Buffer &buffer);                                          // 收到数据时的回调
     void OnClose(const ConnPtr &conn);                                                            // 连接关闭时的回调

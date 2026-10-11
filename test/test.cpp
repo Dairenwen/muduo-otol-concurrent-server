@@ -1985,7 +1985,8 @@ namespace http_test
         response.SetContent(body, type);
     }
 
-    void Configure(HttpServer &server, const std::string &root, int threads)
+    void Configure(HttpServer &server, const std::string &root, int threads,
+                   int slow_ready_fd = -1)
     {
         server.SetStaticDir(root);
         server.SetThreadCount(threads);
@@ -2017,8 +2018,27 @@ namespace http_test
         std::string key = "Connection", value = "close";
         response.SetHeader(key, value); });
         // 以下路由只用于测试，不添加到正式 main.cpp。
-        server.AddGetRoute("/_test/slow", [](const HttpRequest &, HttpResponse &response)
-                           { std::this_thread::sleep_for(std::chrono::milliseconds(3500)); Text(response, "slow\n"); });
+        server.AddGetRoute("/_test/thread", [](const HttpRequest &, HttpResponse &response)
+                           {
+            // 同一长连接先查询线程，再发业务请求，确认实际由哪个 Loop 处理。
+            std::ostringstream id;
+            id << std::this_thread::get_id();
+            Text(response, id.str()); });
+        server.AddGetRoute("/_test/slow", [slow_ready_fd](const HttpRequest &, HttpResponse &response)
+                           {
+            if (slow_ready_fd >= 0)
+            {
+                // 通知父进程：慢处理函数已经进入，避免用固定 sleep 猜测开始时间。
+                const char started = 'S';
+                ssize_t count;
+                do
+                {
+                    count = write(slow_ready_fd, &started, sizeof(started));
+                } while (count < 0 && errno == EINTR);
+                Check(count == static_cast<ssize_t>(sizeof(started)), "slow handler notification failed");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+            Text(response, "slow\n"); });
         server.AddGetRoute("/_test/throw", [](const HttpRequest &, HttpResponse &response)
                            {
             // 按业务处理函数自行捕获异常的方式测试，不要求服务框架兜底。
@@ -2045,18 +2065,18 @@ namespace http_test
         response.SetHeader(key, value); });
         // 制造大小写不同的同名字段，检查最终响应是否正确覆盖且没有重复字段。
         server.AddGetRoute("/_test/header-case",
-            [](const HttpRequest &, HttpResponse &response)
-            {
-                std::string type_key = "content-type";
-                std::string old_type = "application/json";
-                response.SetHeader(type_key, old_type);
+                           [](const HttpRequest &, HttpResponse &response)
+                           {
+                               std::string type_key = "content-type";
+                               std::string old_type = "application/json";
+                               response.SetHeader(type_key, old_type);
 
-                std::string connection_key = "connection";
-                std::string connection_value = "keep-alive";
-                response.SetHeader(connection_key, connection_value);
+                               std::string connection_key = "connection";
+                               std::string connection_value = "keep-alive";
+                               response.SetHeader(connection_key, connection_value);
 
-                Text(response, "header case\n");
-            });
+                               Text(response, "header case\n");
+                           });
     }
 
     // 每个服务器在独立进程中运行。崩溃测试不会中断其余测试。Stop 走实际停止和析构流程；只有超过等待上限时才终止本次创建的进程。
@@ -2064,11 +2084,12 @@ namespace http_test
     {
         pid_t child;
         int control;
+        int slow_ready;
 
     public:
         uint16_t port;
         ServerProcess(const std::string &root, int timeout = 3, int threads = 3)
-            : child(-1), control(-1), port(0)
+            : child(-1), control(-1), slow_ready(-1), port(0)
         {
             int ready[2], done[2];
             Check(pipe(ready) == 0, "ready pipe failed");
@@ -2126,14 +2147,14 @@ namespace http_test
                                 throw;
                         }
                     }
-                    Configure(*server, root, threads);
+                    Configure(*server, root, threads, ready[1]);
                     ssize_t n;
                     do
                     {
                         n = write(ready[1], &port, sizeof(port));
                     } while (n < 0 && errno == EINTR);
                     Check(n == static_cast<ssize_t>(sizeof(port)), "port handoff failed");
-                    close(ready[1]);
+                    // 端口交接后保留管道，慢处理测试用它发送开始通知。
                     std::thread completion([&server, &done]()
                                            {
                     char byte;
@@ -2143,6 +2164,7 @@ namespace http_test
                     server->Start();
                     completion.join();
                     server.reset(); // 真实析构，能够发现活动连接的生命周期问题。
+                    close(ready[1]);
                     close(done[1]);
                     _exit(0);
                 }
@@ -2155,6 +2177,7 @@ namespace http_test
             close(ready[1]);
             close(done[1]);
             control = done[0];
+            slow_ready = ready[0];
             pollfd event = {ready[0], POLLIN, 0};
             int result;
             do
@@ -2162,7 +2185,6 @@ namespace http_test
                 result = poll(&event, 1, 5000);
             } while (result < 0 && errno == EINTR);
             ssize_t n = result > 0 ? read(ready[0], &port, sizeof(port)) : -1;
-            close(ready[0]);
             if (n != static_cast<ssize_t>(sizeof(port)) || port == 0)
             {
                 Stop();
@@ -2170,8 +2192,32 @@ namespace http_test
             }
         }
         pid_t Pid() const { return child; }
+        void WaitForSlowStart()
+        {
+            pollfd event = {slow_ready, POLLIN, 0};
+            int ready;
+            do
+            {
+                ready = poll(&event, 1, 5000);
+            } while (ready < 0 && errno == EINTR);
+            Check(ready > 0 && (event.revents & POLLIN), "slow handler did not start within 5 seconds");
+
+            char started = 0;
+            ssize_t count;
+            do
+            {
+                count = read(slow_ready, &started, sizeof(started));
+            } while (count < 0 && errno == EINTR);
+            Check(count == static_cast<ssize_t>(sizeof(started)) && started == 'S',
+                  "invalid slow handler notification");
+        }
         int Stop()
         {
+            if (slow_ready >= 0)
+            {
+                close(slow_ready);
+                slow_ready = -1;
+            }
             if (child < 0)
                 return 0;
             const char byte = 1;
@@ -2315,6 +2361,77 @@ namespace http_test
               "webbench reported failed requests or no successes");
         // webbench 不检查 HTTP 状态和正文，所以调用方还会检查压测前后的真实响应。
     }
+    // 本组只验证请求行正则匹配成功后，路径校验失败的 HEAD 响应。
+    // 裸 LF、超长请求行和错误版本在方法赋值前被拒绝，按本次确认暂不覆盖。
+    // Read(true) 只读响应头，Exchange() 随后检查 EOF；
+    // 若服务器多发正文或下一条响应，测试会失败。
+    void TestHeadErrorResponses(Suite &suite, uint16_t port)
+    {
+        struct HeadCase
+        {
+            std::string name;
+            std::string wire;
+            int status;
+        };
+
+        const std::vector<HeadCase> cases = {
+            {"bad escape", Wire("HEAD", "/bad%ZZ"), 400},
+            {"traversal", Wire("HEAD", "/../CMakeLists.txt"), 400},
+            {"encoded traversal", Wire("HEAD", "/%2e%2e/CMakeLists.txt"), 400},
+            {"NUL path", Wire("HEAD", "/index.html%00suffix"), 400},
+            {"mixed-case method", Wire("hEaD", "/bad%ZZ"), 400}
+        };
+
+        for (const HeadCase &item : cases)
+        {
+            suite.Run("HEAD error without body: " + item.name, [&, item]()
+            {
+                const Response response = Exchange(port, item.wire, true);
+                Check(response.status == item.status, "wrong HEAD error status");
+
+                // HEAD 保留对应 GET 错误正文的长度，但实际不发送正文。
+                const std::string expected_body = Util::StatusDesc(item.status) + "\n";
+                Check(response.headers.at("content-length") ==
+                          std::to_string(expected_body.size()),
+                      "wrong HEAD error Content-Length");
+            });
+        }
+
+        suite.Run("HEAD error with fragmented method", [&]()
+        {
+            Client client(port);
+            client.Send("HE");
+
+            // 方法尚未完整，服务器应等待后续数据，不应提前报错或关闭。
+            pollfd event = {client.Fd(), POLLIN, 0};
+            int ready;
+            do
+            {
+                ready = poll(&event, 1, 20);
+            } while (ready < 0 && errno == EINTR);
+            Check(ready == 0, "incomplete HEAD method received an early response");
+
+            client.Send("AD /bad%ZZ HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+            const Response response = client.Read(true);
+            Check(response.status == 400 && response.headers.at("connection") == "close",
+                  "fragmented HEAD error response was incorrect");
+            client.Eof(); // 确认线上没有错误正文。
+        });
+
+        suite.Run("HEAD error discards following pipeline request", [&]()
+        {
+            const Response response = Exchange(port,
+                Wire("HEAD", "/bad%ZZ", false) + Wire("GET", "/api/status"), true);
+            Check(response.status == 400, "HEAD pipeline did not return HTTP 400");
+        });
+
+        suite.Run("GET error still includes its body", [&]()
+        {
+            const Response response = Exchange(port, Wire("GET", "/bad%ZZ"));
+            Check(response.status == 400 && response.body == "Bad Request\n",
+                  "HEAD handling changed the GET error body");
+        });
+    }
 } // namespace http_test
 
 void testhttpserver()
@@ -2350,7 +2467,7 @@ void testhttpserver()
     const std::string status_body = "{\"status\":\"ok\",\"server\":\"muduo-otol\"}\n";
 
     suite.Run("request header names ignore case", []()
-    {
+              {
         Buffer buffer;
         buffer.WriteStringAndPush(
             "GET / HTTP/1.1\r\n"
@@ -2379,10 +2496,9 @@ void testhttpserver()
         request.SetHeader("AUTHORIZATION", "Bearer NewToken");
         std::string authorization = "Authorization";
         Check(request.GetHeader(authorization) == "Bearer NewToken",
-              "request header was not updated");
-    });
+              "request header was not updated"); });
     suite.Run("response header names ignore case", []()
-    {
+              {
         HttpResponse response;
         std::string key = "content-type";
         std::string value = "application/json";
@@ -2405,18 +2521,16 @@ void testhttpserver()
         response.SetHeader(location, old_url);
         response.SetRedirect(new_url);
         Check(response.GetHeader(location) == new_url,
-              "SetRedirect did not replace the old location");
-    });
+              "SetRedirect did not replace the old location"); });
     suite.Run("response headers have no case duplicates", [&]()
-    {
+              {
         // Client::Read 按不区分大小写的名称检查重复字段，不会只保留最后一个值。
         const Response response = Exchange(port, Wire("GET", "/_test/header-case"));
         Check(response.status == 200 && response.body == "header case\n",
               "response status or body mismatch");
         Check(response.headers.at("content-type") == "text/plain; charset=utf-8",
               "wrong final content type");
-        Check(response.headers.at("connection") == "close", "wrong final connection policy");
-    });
+        Check(response.headers.at("connection") == "close", "wrong final connection policy"); });
 
     // 第一部分：重写已有覆盖。比较真实文件字节、MIME、长度和连接关闭状态。
     const std::vector<std::string> files = {
@@ -2518,7 +2632,7 @@ void testhttpserver()
 
     // 暂不支持 Expect：客户端只发请求头、等待确认时，也必须立即得到 417。
     // 一秒接收超时短于测试服务的三秒空闲超时，避免把空闲关闭误判为主动拒绝。
-    const std::vector<std::pair<std::string, std::string> > expectations = {
+    const std::vector<std::pair<std::string, std::string>> expectations = {
         {"100-continue", "Expect: 100-continue"},
         {"mixed case", "eXpEcT: 100-CoNtInUe"},
         {"unknown value", "Expect: unsupported"},
@@ -2527,7 +2641,7 @@ void testhttpserver()
     for (const std::pair<std::string, std::string> &expectation : expectations)
     {
         suite.Run("reject Expect " + expectation.first, [&, expectation]()
-        {
+                  {
             Client client(port, 1);
             client.Send("POST /api/items HTTP/1.1\r\nHost: a\r\n" + expectation.second +
                         "\r\nContent-Length: 10\r\n\r\n");
@@ -2535,11 +2649,10 @@ void testhttpserver()
             Check(response.status == 417 && response.body == "Expectation Failed\n",
                   "Expect was not rejected before receiving the body");
             Check(response.headers.at("connection") == "close", "Expect rejection kept connection alive");
-            client.Eof();
-        });
+            client.Eof(); });
     }
     suite.Run("fragmented Expect headers", [&]()
-    {
+              {
         Client client(port, 1);
         client.Send("POST /api/items HTTP/1.1\r\nHost: a\r\nExpect: 100-con");
         pollfd event = {client.Fd(), POLLIN, 0};
@@ -2548,10 +2661,9 @@ void testhttpserver()
         const Response response = client.Read();
         Check(response.status == 417 && response.headers.at("connection") == "close",
               "fragmented Expect did not produce a closing 417 response");
-        client.Eof();
-    });
+        client.Eof(); });
     suite.Run("Expect rejects already received body and following pipeline", [&]()
-    {
+              {
         Client client(port);
         // 正文和下一条请求已到达时，仍应拒绝本次请求并丢弃后续数据。
         client.Send("POST /api/items HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n"
@@ -2561,25 +2673,22 @@ void testhttpserver()
               "Expect reached the handler or kept the pipeline alive");
         client.Eof();
         Check(Exchange(port, Wire("GET", "/api/status")).body == status_body,
-              "server unavailable after rejecting Expect");
-    });
+              "server unavailable after rejecting Expect"); });
     suite.Run("HEAD with Expect has no response body", [&]()
-    {
+              {
         const Response response = Exchange(port,
             "HEAD /api/status HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n"
             "Content-Length: 10\r\n\r\n", true);
         Check(response.status == 417 && response.body.empty() &&
               response.headers.at("content-length") == std::to_string(std::string("Expectation Failed\n").size()),
-              "HEAD Expect error response was incorrect");
-    });
+              "HEAD Expect error response was incorrect"); });
     suite.Run("HTTP/1.0 ignores Expect", [&]()
-    {
+              {
         const Response response = Exchange(port,
             "POST /api/items HTTP/1.0\r\nExpect: 100-continue\r\n"
             "Content-Length: 10\r\n\r\n0123456789");
         Check(response.version == "HTTP/1.0" && response.status == 200 && response.body == "POST bytes=10\n",
-              "HTTP/1.0 Expect changed normal body handling");
-    });
+              "HTTP/1.0 Expect changed normal body handling"); });
 
     suite.Run("large POST then GET boundary", [&]()
               {
@@ -2634,6 +2743,8 @@ void testhttpserver()
         std::string wire = "GET / HTTP/1.1\r\nHost: a\r\n";
         for (int i = 0; i < 80; ++i) wire += "X: " + std::string(900, 'a') + "\r\n";
         Check(Exchange(port, wire).status == 431, "total header limit failed"); });
+
+    TestHeadErrorResponses(suite, port);
 
     const size_t basic_cases = suite.cases, basic_failures = suite.failures;
     std::cout << "[HTTP BASIC SUMMARY] cases=" << basic_cases << ", failures=" << basic_failures << std::endl;
@@ -2734,22 +2845,63 @@ void testhttpserver()
                     }
                 }));
             for (std::future<void> &client : clients) client.get(); });
-        suite.Run("finaltest processing timeout and worker isolation", [&]()
-                  {
-            ServerProcess isolated(root, 2, 1);
-            Client slow(isolated.port), fast(isolated.port);
-            const std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-            slow.Send(Wire("GET", "/_test/slow"));
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            fast.Send(Wire("GET", "/api/status"));
-            bool fast_ok = false;
-            try { fast_ok = fast.Read().body == status_body; fast.Eof(); }
-            catch (const std::exception &) {}
-            fast.Close();
-            const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
-            slow.Close();
-            std::cout << "[PROCESSING] slow_handler_ms=3500 idle_timeout_ms=2000 fast_completed_ms=" << ms << std::endl;
-            Check(fast_ok && ms < 1000, "slow handler blocked fast request or made it expire; idle timeout did not interrupt processing"); });
+        for (int threads = 0; threads <= 2; ++threads)
+        {
+            suite.Run("finaltest synchronous slow handler, I/O workers=" + std::to_string(threads),
+                      [&, threads]()
+                      {
+                          // 这组用例验证串行处理和不同 Loop 的隔离，不要求空闲超时打断业务。
+                          // 空闲超时设为 10 秒，避免 3.5 秒慢处理期间连接因计时到期关闭。
+                          ServerProcess isolated(root, 10, threads);
+                          Client slow(isolated.port, 10), fast(isolated.port, 10);
+                          slow.Send(Wire("GET", "/_test/thread", false));
+                          const Response slow_thread = slow.Read();
+                          fast.Send(Wire("GET", "/_test/thread", false));
+                          const Response fast_thread = fast.Read();
+                          Check(slow_thread.status == 200 && fast_thread.status == 200 &&
+                                    !slow_thread.body.empty() && !fast_thread.body.empty(),
+                                "cannot identify connection Loop threads");
+                          const bool same_loop = slow_thread.body == fast_thread.body;
+                          Check(same_loop == (threads < 2), "connections did not use the expected Loop threads");
+
+                          const std::chrono::steady_clock::time_point slow_begin = std::chrono::steady_clock::now();
+                          slow.Send(Wire("GET", "/_test/slow"));
+                          isolated.WaitForSlowStart();
+                          const std::chrono::steady_clock::time_point fast_begin = std::chrono::steady_clock::now();
+                          fast.Send(Wire("GET", "/api/status"));
+                          const Response fast_response = fast.Read();
+                          fast.Eof();
+                          const std::chrono::steady_clock::time_point fast_end = std::chrono::steady_clock::now();
+                          Check(fast_response.status == 200 && fast_response.body == status_body,
+                                "fast request response was incomplete or incorrect");
+                          const Response slow_response = slow.Read();
+                          slow.Eof();
+                          Check(slow_response.status == 200 && slow_response.body == "slow\n",
+                                "slow request response was incomplete or incorrect");
+
+                          const long fast_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fast_end - fast_begin).count();
+                          const long fast_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fast_end - slow_begin).count();
+                          const long slow_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - slow_begin).count();
+                          std::cout << "[PROCESSING] workers=" << threads << " same_loop=" << same_loop
+                                    << " fast_ms=" << fast_ms << " slow_ms=" << slow_ms << std::endl;
+                          Check(slow_ms >= 3000 && slow_ms < 8000, "slow handler duration outside expected window");
+                          if (same_loop)
+                          {
+                              // 0 个从 Loop 时都在主线程；1 个时都在唯一从线程。普通请求应等待慢业务结束。
+                              Check(fast_total_ms >= 3000 && fast_total_ms < 8000,
+                                    "same-Loop request did not wait for synchronous slow processing");
+                          }
+                          else
+                          {
+                              // 两个连接经 RR 分到不同 Loop，普通请求应在慢处理结束前完成。
+                              Check(fast_ms < 1500 && fast_total_ms < 3000,
+                                    "slow processing on one Loop blocked another Loop");
+                          }
+                          const int status = isolated.Stop();
+                          Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                                "server teardown failed after slow processing");
+                      });
+        }
         suite.Run("finaltest handler catches its own exception", [&]()
                   {
             ServerProcess isolated(root);
@@ -2793,32 +2945,89 @@ void testhttpserver()
                     Check(Exchange(port, Wire("GET", "/api/status")).body == status_body,
                         "server unavailable after rejecting invalid response header"); });
 
+        suite.Run("finaltest disconnect during output backlog", [&]()
+                  {
+                    ServerProcess isolated(root, 10, 1);
+                    Client client(isolated.port, 10);
+
+                    int small = 1024;
+                    Check(setsockopt(client.Fd(), SOL_SOCKET, SO_RCVBUF,
+                                    &small, sizeof(small)) == 0,
+                        "small receive buffer failed");
+
+                    std::string wire;
+                    for (int i = 0; i < 32; ++i)
+                        wire += Wire("GET", "/_test/large", false);
+
+                    client.Send(wire);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+                    // 未读完响应就关闭，检查积压连接关闭后工作线程是否正常。
+                    client.Close();
+
+                    Check(Exchange(isolated.port, Wire("GET", "/api/status")).body ==
+                            status_body,
+                        "worker unavailable after client disconnect");
+
+                    const int status = isolated.Stop();
+                    Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                        "server teardown failed after client disconnect"); });
+
         suite.Run("finaltest bounded pipeline output memory", [&]()
                   {
-            ServerProcess isolated(root);
-            Client client(isolated.port);
-            int small = 1024;
-            Check(setsockopt(client.Fd(), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0, "small receive buffer failed");
-            const long before = RssKiB(isolated.Pid());
-            std::string wire;
-            for (int i = 0; i < 32; ++i) wire += Wire("GET", "/_test/large", false);
-            client.Send(wire);
-            std::this_thread::sleep_for(std::chrono::milliseconds(700));
-            const long growth = RssKiB(isolated.Pid()) - before;
-            client.Close();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            std::cout << "[MEMORY] 32x2MiB pipeline rss_growth_kib=" << growth << std::endl;
-            // 32 MiB 是测试的资源预算，不是 HTTP 协议要求。
-            Check(growth < 32 * 1024, "output has no backpressure/high-water limit; RSS exceeded test budget"); });
-        suite.Run("finaltest stop with active connection", [&]()
-                  {
-            ServerProcess isolated(root, 30);
-            Client client(isolated.port);
-            client.Send(Wire("GET", "/api/status", false));
-            Check(client.Read().body == status_body, "active connection setup failed");
-            const int status = isolated.Stop();
-            Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                  "active-connection shutdown crashed/hung; wait_status=" + std::to_string(status)); });
+                    const int requests = 32;
+                    ServerProcess isolated(root, 10, 1);
+                    Client client(isolated.port, 10);
+
+                    // 使用默认接收窗口，避免极小窗口让恢复读取后的传输仍然很慢。
+                    // 64 MiB 响应配合延迟读取，仍足以填满内核发送缓冲区并触发积压。
+                    const long before = RssKiB(isolated.Pid());
+                    std::string wire;
+
+                    for (int i = 0; i < requests; ++i)
+                    {
+                        wire += Wire("GET", "/_test/large", false);
+                        wire += Wire("GET", "/api/query?name=" + std::to_string(i),
+                                    i == requests - 1);
+                    }
+
+                    client.Send(wire);
+
+                    // 暂不读取，让服务器产生发送积压。
+                    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+                    const long growth = RssKiB(isolated.Pid()) - before;
+                    std::cout << "[MEMORY] groups=" << requests
+                            << " rss_growth_kib=" << growth << std::endl;
+
+                    // 这是本测试环境的资源预算，不是 HTTP 协议要求。
+                    Check(growth < 32 * 1024, "RSS exceeded test memory budget");
+
+                    std::string expected(2 * 1024 * 1024, '\0');
+                    for (size_t i = 0; i < expected.size(); ++i)
+                        expected[i] = static_cast<char>(i % 251);
+
+                    // 恢复读取后，每条响应都必须完整且保持原顺序。
+                    for (int i = 0; i < requests; ++i)
+                    {
+                        const Response large = client.Read();
+                        Check(large.status == 200 && large.body == expected,
+                            "large response missing or corrupted after resume");
+
+                        const Response numbered = client.Read();
+                        Check(numbered.status == 200 &&
+                                numbered.body ==
+                                    "name=" + std::to_string(i) + "\ntag=\n",
+                            "response order incorrect after resume");
+                    }
+
+                    client.Eof();
+                    Check(Exchange(isolated.port, Wire("GET", "/api/status")).body ==
+                            status_body,
+                        "server unavailable after output resume");
+
+                    const int status = isolated.Stop();
+                    Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                        "server teardown failed after output resume"); });
         for (int clients : std::vector<int>{10, 50, 100})
             suite.Run("finaltest webbench " + std::to_string(clients), [&, clients]()
                       {

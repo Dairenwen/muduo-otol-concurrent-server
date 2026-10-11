@@ -32,7 +32,7 @@ bool HttpContext::SetError(int status)
 
 bool HttpContext::ReadLine(Buffer &buffer, std::string &line)
 {
-    char *end = buffer.FindCRLF();
+    char *end = buffer.FindCRLF(); // 找到第一行的\r\n
     const size_t length = end == nullptr ? buffer.ReadAbleSize() : (size_t)(end - buffer.GetReaderPtr() + 1);
     // 即使尚未收到换行也检查长度，请求行过长返回 414，头字段过长返回 431。
     if (length > MAX_LINE_SIZE)
@@ -66,6 +66,15 @@ bool HttpContext::ParseHttpLine(const std::string &line)
     if (!std::regex_match(line, matches, pattern))
         return SetError(400);
 
+    _request._method = matches[1].str();
+
+    std::transform(_request._method.begin(), _request._method.end(),
+                   _request._method.begin(),
+                   [](unsigned char ch)
+                   {
+                       return static_cast<char>(std::toupper(ch));
+                   });
+
     const std::string target = matches[2].str();
     const std::string query = matches[3].str();
     // 当前解析器处理 /path?query 形式的请求目标。
@@ -81,16 +90,6 @@ bool HttpContext::ParseHttpLine(const std::string &line)
     // 路径和查询参数都需要 URL 解码；但只有查询参数中的 `+` 通常转换为空格，路径中的 `+` 应保留为普通加号。
     if (!Util::UrlDecode(target, path) || !Util::ValidPath(path))
         return SetError(400);
-
-    _request._method = matches[1].str();
-
-    // 统一方法名称
-    std::transform(_request._method.begin(), _request._method.end(),
-                   _request._method.begin(),
-                   [](unsigned char ch)
-                   {
-                       return static_cast<char>(std::toupper(ch));
-                   });
 
     _request._path = std::move(path);
     _request._version = matches[4].str();
